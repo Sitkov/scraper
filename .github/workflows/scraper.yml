@@ -1,0 +1,27 @@
+name: EKTC Scraper
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch: {}
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Install deps
+        run: |
+          npm ci || npm i
+          npx playwright install chromium
+      - name: Restore state.json
+        run: |
+          echo "$STATE_JSON_B64" | base64 -d > state.json
+        env:
+          STATE_JSON_B64: ${{ secrets.STATE_JSON_B64 }}
+      - name: Run scraper
+        env:
+          SITE_BASE:  ${{ secrets.SITE_BASE }}
+          ADMIN_PASS: ${{ secrets.ADMIN_PASS }}
+        run: node scrape.js
