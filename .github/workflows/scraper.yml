@@ -8,38 +8,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-
-      - name: Node/Env info
-        run: |
-          node -v
-          npm -v
-          echo "SITE_BASE set: $([ -n "$SITE_BASE" ] && echo yes || echo no)"
-          echo "ADMIN_PASS set: $([ -n "$ADMIN_PASS" ] && echo yes || echo no)"
-          echo "STATE_JSON_B64 length: ${#STATE_JSON_B64}"
-        env:
-          SITE_BASE: ${{ secrets.SITE_BASE }}
-          ADMIN_PASS: ${{ secrets.ADMIN_PASS }}
-          STATE_JSON_B64: ${{ secrets.STATE_JSON_B64 }}
-
       - name: Install deps
         run: |
           npm ci || npm i
           npx playwright install chromium
           npx playwright install-deps chromium
-
-      - name: Restore state.json
-        run: |
-          echo "$STATE_JSON_B64" | base64 -d > state.json
-          stat -c "state.json size: %s" state.json || ls -l state.json
+      - name: Restore state.json (robust)
         env:
           STATE_JSON_B64: ${{ secrets.STATE_JSON_B64 }}
-
-      - name: Run scraper (debug)
+        run: |
+          node -e "const fs=require('fs');const s=(process.env.STATE_JSON_B64||'').replace(/\s+/g,'');fs.writeFileSync('state.json', Buffer.from(s,'base64'));"
+          ls -l state.json
+      - name: Run scraper
         env:
           SITE_BASE:  ${{ secrets.SITE_BASE }}
           ADMIN_PASS: ${{ secrets.ADMIN_PASS }}
-        run: node scrape.js --debug
+        run: node scrape.js
