@@ -1,5 +1,8 @@
-// scrape.js (ESM): Playwright + ЕСИА (state.json)
-// Берём только «Изменения в расписании …», PDF качаем и загружаем на сайт, затем добавляем запись с локальным URL
+// scrape.js (ESM) — Playwright + ЕСИА (state.json)
+// Берём только «Изменения в расписании …».
+// PDF скачиваем, грузим на ваш сайт (/api/admin/upload_pdf), добавляем запись с локальным URL и source.
+// Дедупликация по source (URL карточки news/show/…), рассылка только при add.added === true.
+
 import { chromium } from 'playwright'
 import fs from 'fs'
 
@@ -19,7 +22,7 @@ const loadSeen = () => loadJson(SEEN_FILE, { ids: [] })
 const saveSeen = (s) => saveJson(SEEN_FILE, s)
 
 async function extractPdfUrl(page) {
-  // 1) <a href="*.pdf"> и типичные download-ссылки
+  // 1) <a href="*.pdf"> или типичные download-ссылки
   const href = await page.evaluate(() => {
     const pdfRe = /\.pdf($|\?)/i
     const as = Array.from(document.querySelectorAll('a[href]'))
@@ -103,27 +106,29 @@ async function main() {
   const found = collected.filter(it => it.url && INCLUDE_RE.test(it.title || '') && !EXCLUDE_RE.test(it.title || ''))
   if (!found.length) { if (DEBUG) console.log('Подходящих нет'); await browser.close(); return }
 
-  // Уже добавленные на сайте (антидубли по URL)
+  // Уже добавленные на сайте (антидубли по source и url)
   let existing = []
   try {
     const r = await context.request.get(`${SITE_BASE}/api/admin/change_list`, { params: { pass: ADMIN_PASS } })
     const j = await r.json(); existing = Array.isArray(j.items) ? j.items : []
   } catch {}
-  const existingUrls = new Set(existing.map(it => (it.url || '').trim()))
+  const existingUrls    = new Set(existing.map(it => (it.url || '').trim()).filter(Boolean))
+  const existingSources = new Set(existing.map(it => (it.source || '').trim()).filter(Boolean))
 
-  const toAdd = found.filter(it => !existingUrls.has((it.url || '').trim()))
+  // Оставляем только новые по source (URL карточки новости)
+  const toAdd = found.filter(it => !existingSources.has((it.newsUrl || '').trim()))
   if (!toAdd.length) { if (DEBUG) console.log('Нет новых после фильтра'); await browser.close(); return }
 
   for (const it of toAdd) {
     try {
-      // 1) качаем PDF как байты (через аутентифицированный контекст)
+      // 1) качаем PDF (через аутентифицированный контекст)
       const pdfResp = await context.request.get(it.url)
       if (!pdfResp.ok()) { console.log('PDF fetch failed', pdfResp.status()); continue }
       const buf = await pdfResp.body()
       if (!buf || buf.length < 1000 || !buf.slice(0,5).toString().startsWith('%PDF-')) { console.log('PDF invalid/too small'); continue }
 
       // 2) грузим на сайт как /api/files/*.pdf
-      const b64 = Buffer.from(buf).toString('base64')
+      const b64  = Buffer.from(buf).toString('base64')
       const safe = (it.title || 'change').replace(/[^\w\-]+/g,'_')
       const upRes = await context.request.post(`${SITE_BASE}/api/admin/upload_pdf`, {
         data: { pass: ADMIN_PASS, data: b64, name: safe }
@@ -132,20 +137,25 @@ async function main() {
       const up = await upRes.json()
       if (!up.ok || !up.url) { console.log('upload bad json', up); continue }
 
-      // 3) добавляем запись с локальной ссылкой (не требует сессии для просмотра)
+      // 3) добавляем запись с локальным url и source
       const addRes = await context.request.post(`${SITE_BASE}/api/admin/change_add`, {
-        data: { pass: ADMIN_PASS, title: it.title, url: up.url }
+        data: { pass: ADMIN_PASS, title: it.title, url: up.url, source: it.newsUrl }
       })
       if (!addRes.ok()) { console.log('ADD failed', addRes.status()); continue }
-      console.log('ADD ok:', it.title)
+      const add = await addRes.json().catch(()=>({}))
+      if (!add.ok) { console.log('ADD bad json', add); continue }
 
-      // 4) опциональная рассылка
-      await new Promise(r => setTimeout(r, 1200))
-      await context.request.post(`${SITE_BASE}/api/admin/broadcast`, {
-        data: { pass: ADMIN_PASS, text: `🔔 Новое изменение!\n${it.title}` }
-      })
+      if (add.added) {
+        console.log('ADD ok (new):', it.title)
+        await new Promise(r => setTimeout(r, 1200))
+        await context.request.post(`${SITE_BASE}/api/admin/broadcast`, {
+          data: { pass: ADMIN_PASS, text: `🔔 Новое изменение!\n${it.title}` }
+        })
+      } else {
+        console.log('SKIP (duplicate source):', it.title)
+      }
 
-      // 5) помечаем карточку обработанной (по URL новости)
+      // 4) помечаем карточку обработанной (по URL новости)
       seen.ids = Array.from(new Set(seen.ids.concat([it.newsUrl]))); saveSeen(seen)
     } catch (e) {
       console.log('Ошибка цикла', it.title, e.message)
