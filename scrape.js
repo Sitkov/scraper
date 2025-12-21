@@ -8,7 +8,6 @@ const SITE_BASE_RAW = (process.env.SITE_BASE || '').trim().replace(/\/+$/, '')
 const ADMIN_PASS    = (process.env.ADMIN_PASS || '').trim()
 const MAX_KEEP      = 3;
 
-const SEEN_FILE  = 'seen.json'
 const INCLUDE_RE = /(изменени[яе]\s+в\s+расписани[ие])/i
 const EXCLUDE_RE = /(экзамен|экзаменац|сесс(ия|ии)|олимпиад|конкурс)/i
 
@@ -40,24 +39,23 @@ async function parseResponse(response, label) {
 
 async function main() {
   console.log('--- СТАРТ ГЛАВНОЙ ФУНКЦИИ ---');
-  // Добавляем игнорирование ошибок HTTPS для стабильности
   const browser = await chromium.launch();
   const context = await browser.newContext({
     storageState: fs.existsSync('state.json') ? 'state.json' : undefined,
-    ignoreHTTPSErrors: true
+    acceptDownloads: true // Обязательно разрешаем скачивание
   });
   const page = await context.newPage();
 
   try {
+    console.log('Захожу на сайт колледжа...');
     await page.goto(DASHBOARD_URL, { waitUntil: 'networkidle', timeout: 60000 });
-    await page.waitForTimeout(5000);
-
+    
     const links = await page.evaluate(() => {
       return Array.from(new Set(Array.from(document.querySelectorAll('a[href]'))
         .map(a => a.href).filter(h => /\/news\/show\/\d+$/i.test(h))));
     });
 
-    console.log(`Найдено ссылок на новости: ${links.length}`);
+    console.log(`Найдено новостей: ${links.length}`);
     const toProcess = links.slice(0, 5); 
 
     for (const url of toProcess) {
@@ -69,23 +67,25 @@ async function main() {
         if (INCLUDE_RE.test(title) && !EXCLUDE_RE.test(title)) {
            console.log(`Проверяю: "${title}"`);
            
-           // Ищем PDF
-           const pdf = await p.evaluate(() => {
-              const a = document.querySelector('a[href*=".pdf"], a[href*="/download/"]');
-              return a ? a.href : '';
-           });
+           // Ищем селектор ссылки на PDF
+           const pdfSelector = 'a[href*=".pdf"], a[href*="/download/"]';
+           const hasPdf = await p.$(pdfSelector);
 
-           if (pdf) {
+           if (hasPdf) {
               const prettyTitle = formatRussianTitle(title);
-              console.log(`✅ Нашел PDF, пробую скачать: ${pdf}`);
+              console.log(`✅ Нашел PDF, начинаю скачивание...`);
 
-              // СКАЧИВАНИЕ: используем браузер вместо прямого запроса
-              const downloadPromise = p.waitForResponse(resp => resp.url() === pdf || resp.headers()['content-type'] === 'application/pdf', { timeout: 60000 });
-              await p.goto(pdf).catch(() => {}); // Переходим по ссылке PDF
-              const pdfResp = await downloadPromise;
-              const buf = await pdfResp.body();
+              // ИСПОЛЬЗУЕМ ОФИЦИАЛЬНЫЙ МЕТОД DOWNLOAD
+              const downloadPromise = p.waitForEvent('download');
+              await p.click(pdfSelector); // Кликаем по ссылке, чтобы вызвать скачивание
+              const download = await downloadPromise;
+              
+              // Ждем завершения и читаем файл в буфер
+              const downloadPath = await download.path();
+              const buf = fs.readFileSync(downloadPath);
               
               if (buf && buf.length > 1000) {
+                console.log(`Файл скачан (${buf.length} байт), отправляю на сервер...`);
                 const upRes = await context.request.post(`${SITE_BASE_RAW}/admin_upload_pdf.php`, {
                   data: { pass: ADMIN_PASS, data: buf.toString('base64'), name: `change_${Date.now()}` }
                 });
@@ -99,6 +99,8 @@ async function main() {
                   if (add.ok) console.log(`🚀 УСПЕШНО ДОБАВЛЕНО: ${prettyTitle}`);
                 }
               }
+           } else {
+             console.log(`❌ PDF не найден в новости ${url}`);
            }
         }
       } catch (e) { console.error(`Ошибка на странице ${url}: ${e.message}`); }
@@ -106,7 +108,7 @@ async function main() {
     }
   } catch (err) { console.error('Критическая ошибка:', err.message); }
 
-  // Очистка
+  // Очистка (оставляем только 3 записи)
   try {
     const listRes = await context.request.get(`${SITE_BASE_RAW}/admin_change_list.php`, { params: { pass: ADMIN_PASS } });
     const data = await parseResponse(listRes, 'Очистка');
