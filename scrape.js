@@ -1,17 +1,16 @@
-// scrape.js (ESM) — Playwright + ЕСИА (state.json)
-// Берём только «Изменения в расписании …».
-// PDF скачиваем, грузим на ваш сайт (/api/admin/upload_pdf), добавляем запись с локальным URL и source.
-// Дедупликация по source (URL карточки news/show/…), рассылка только при add.added === true.
+// scrape.js (ESM) — Playwright + PHP API
+// Сохраняет только 3 последние записи, остальные удаляет.
 
 import { chromium } from 'playwright'
 import fs from 'fs'
 
 const DASHBOARD_URL = 'https://t15.ecp.egov66.ru/dashboard'
-const SITE_BASE  = process.env.SITE_BASE
+const SITE_BASE  = process.env.SITE_BASE  // Ссылка до папки /api/
 const ADMIN_PASS = process.env.ADMIN_PASS
 
 const DEBUG = process.argv.includes('--debug')
 const SEEN_FILE = 'seen.json'
+const MAX_KEEP = 3; // ОСТАВЛЯЕМ ТОЛЬКО 3 ЗАПИСИ
 
 const INCLUDE_RE = /(изменени[яе]\s+в\s+расписани[ие])/i
 const EXCLUDE_RE = /(экзамен|экзаменац|сесс(ия|ии)|олимпиад|конкурс)/i
@@ -22,7 +21,6 @@ const loadSeen = () => loadJson(SEEN_FILE, { ids: [] })
 const saveSeen = (s) => saveJson(SEEN_FILE, s)
 
 async function extractPdfUrl(page) {
-  // 1) <a href="*.pdf"> или типичные download-ссылки
   const href = await page.evaluate(() => {
     const pdfRe = /\.pdf($|\?)/i
     const as = Array.from(document.querySelectorAll('a[href]'))
@@ -33,14 +31,12 @@ async function extractPdfUrl(page) {
   })
   if (href) return href
 
-  // 2) iframe/embed/object
   const frameSrc = await page.evaluate(() => {
     const pick = (sel, attr) => { const el = document.querySelector(sel); return el ? el.getAttribute(attr) || '' : '' }
     return pick('iframe[src*=".pdf"]', 'src') || pick('embed[src*=".pdf"]', 'src') || pick('object[data*=".pdf"]', 'data') || ''
   })
   if (frameSrc) return frameSrc
 
-  // 3) По сети (Content-Type: application/pdf)
   let pdf = ''
   const onResp = resp => { try { const ct=(resp.headers()['content-type']||'').toLowerCase(); if (ct.includes('application/pdf')) pdf = resp.url() } catch {} }
   page.on('response', onResp)
@@ -80,87 +76,86 @@ async function main() {
   await page.waitForTimeout(3500)
 
   const links = await discoverNewsLinks(page)
-  if (DEBUG) console.log('Нашли карточек:', links.length)
-
   const toProcess = links.filter(h => !seen.ids.includes(h))
-  if (!toProcess.length) { if (DEBUG) console.log('Новых нет'); await browser.close(); return }
 
   const collected = []
-  for (const url of toProcess.slice(0, 20)) {
-    try {
-      const p = await context.newPage()
-      await p.goto(url, { waitUntil: 'domcontentloaded' })
-      await p.waitForTimeout(1500)
-      const title = await p.evaluate(() => {
-        const el = document.querySelector('h1,h2,.title,.news-title')
-        return (el?.textContent || document.title || 'Изменение').trim()
-      })
-      const pdf = await extractPdfUrl(p)
-      await p.close()
-      collected.push({ title, url: pdf, newsUrl: url })
-      if (DEBUG) console.log(pdf ? `PDF: ${title} -> ${pdf}` : `PDF не найден на ${url}`)
-    } catch (e) { if (DEBUG) console.log('Ошибка карточки:', url, e.message) }
-  }
-
-  // Фильтр: только «Изменения в расписании …»
-  const found = collected.filter(it => it.url && INCLUDE_RE.test(it.title || '') && !EXCLUDE_RE.test(it.title || ''))
-  if (!found.length) { if (DEBUG) console.log('Подходящих нет'); await browser.close(); return }
-
-  // Уже добавленные на сайте (антидубли по source и url)
-  let existing = []
-  try {
-    const r = await context.request.get(`${SITE_BASE}/api/admin/change_list`, { params: { pass: ADMIN_PASS } })
-    const j = await r.json(); existing = Array.isArray(j.items) ? j.items : []
-  } catch {}
-  const existingUrls    = new Set(existing.map(it => (it.url || '').trim()).filter(Boolean))
-  const existingSources = new Set(existing.map(it => (it.source || '').trim()).filter(Boolean))
-
-  // Оставляем только новые по source (URL карточки новости)
-  const toAdd = found.filter(it => !existingSources.has((it.newsUrl || '').trim()))
-  if (!toAdd.length) { if (DEBUG) console.log('Нет новых после фильтра'); await browser.close(); return }
-
-  for (const it of toAdd) {
-    try {
-      // 1) качаем PDF (через аутентифицированный контекст)
-      const pdfResp = await context.request.get(it.url)
-      if (!pdfResp.ok()) { console.log('PDF fetch failed', pdfResp.status()); continue }
-      const buf = await pdfResp.body()
-      if (!buf || buf.length < 1000 || !buf.slice(0,5).toString().startsWith('%PDF-')) { console.log('PDF invalid/too small'); continue }
-
-      // 2) грузим на сайт как /api/files/*.pdf
-      const b64  = Buffer.from(buf).toString('base64')
-      const safe = (it.title || 'change').replace(/[^\w\-]+/g,'_')
-      const upRes = await context.request.post(`${SITE_BASE}/api/admin/upload_pdf`, {
-        data: { pass: ADMIN_PASS, data: b64, name: safe }
-      })
-      if (!upRes.ok()) { console.log('upload failed', upRes.status()); continue }
-      const up = await upRes.json()
-      if (!up.ok || !up.url) { console.log('upload bad json', up); continue }
-
-      // 3) добавляем запись с локальным url и source
-      const addRes = await context.request.post(`${SITE_BASE}/api/admin/change_add`, {
-        data: { pass: ADMIN_PASS, title: it.title, url: up.url, source: it.newsUrl }
-      })
-      if (!addRes.ok()) { console.log('ADD failed', addRes.status()); continue }
-      const add = await addRes.json().catch(()=>({}))
-      if (!add.ok) { console.log('ADD bad json', add); continue }
-
-      if (add.added) {
-        console.log('ADD ok (new):', it.title)
-        await new Promise(r => setTimeout(r, 1200))
-        await context.request.post(`${SITE_BASE}/api/admin/broadcast`, {
-          data: { pass: ADMIN_PASS, text: `🔔 Новое изменение!\n${it.title}` }
+  if (toProcess.length > 0) {
+    for (const url of toProcess.slice(0, 5)) {
+      try {
+        const p = await context.newPage()
+        await p.goto(url, { waitUntil: 'domcontentloaded' })
+        await p.waitForTimeout(1500)
+        const title = await p.evaluate(() => {
+          const el = document.querySelector('h1,h2,.title,.news-title')
+          return (el?.textContent || document.title || 'Изменение').trim()
         })
-      } else {
-        console.log('SKIP (duplicate source):', it.title)
-      }
-
-      // 4) помечаем карточку обработанной (по URL новости)
-      seen.ids = Array.from(new Set(seen.ids.concat([it.newsUrl]))); saveSeen(seen)
-    } catch (e) {
-      console.log('Ошибка цикла', it.title, e.message)
+        const pdf = await extractPdfUrl(p)
+        await p.close()
+        collected.push({ title, url: pdf, newsUrl: url })
+      } catch (e) {}
     }
   }
+
+  // Фильтр только нужных новостей
+  const found = collected.filter(it => it.url && INCLUDE_RE.test(it.title || '') && !EXCLUDE_RE.test(it.title || ''))
+  
+  // Добавление новых
+  if (found.length > 0) {
+    for (const it of found) {
+      try {
+        const pdfResp = await context.request.get(it.url)
+        if (!pdfResp.ok()) continue
+        const buf = await pdfResp.body()
+
+        const b64 = Buffer.from(buf).toString('base64')
+        const upRes = await context.request.post(`${SITE_BASE}/admin_upload_pdf.php`, {
+          data: { pass: ADMIN_PASS, data: b64, name: `change_${Date.now()}` }
+        })
+        const up = await upRes.json()
+        if (!up.ok) continue
+
+        const addRes = await context.request.post(`${SITE_BASE}/admin_change_add.php`, {
+          data: { pass: ADMIN_PASS, title: it.title, url: up.url, source: it.newsUrl }
+        })
+        const add = await addRes.json()
+
+        if (add.ok && add.added) {
+          console.log('ДОБАВЛЕНО:', it.title)
+          await context.request.post(`${SITE_BASE}/admin_broadcast.php`, {
+            data: { pass: ADMIN_PASS, text: `🔔 Новое изменение!\n${it.title}` }
+          }).catch(() => {})
+        }
+        seen.ids.push(it.newsUrl)
+      } catch (e) { console.log('Ошибка при добавлении:', e.message) }
+    }
+    saveSeen(seen)
+  }
+
+  // --- БЛОК ОЧИСТКИ (ОСТАВЛЯЕМ ТОЛЬКО 3 ЗАПИСИ) ---
+  try {
+    if (DEBUG) console.log('Проверка лимита записей...')
+    const listRes = await context.request.get(`${SITE_BASE}/admin_change_list.php`, { params: { pass: ADMIN_PASS } })
+    const data = await listRes.json()
+    let items = Array.isArray(data.items) ? data.items : []
+
+    // Сортируем: новые ID (таймстампы) всегда больше, значит будут первыми
+    items.sort((a, b) => (b.id || 0) - (a.id || 0))
+
+    if (items.length > MAX_KEEP) {
+      const toDelete = items.slice(MAX_KEEP) // Берем всё что после 3-го элемента
+      console.log(`Лимит превышен. Удаляю ${toDelete.length} старых записей...`)
+      
+      for (const item of toDelete) {
+        const delRes = await context.request.post(`${SITE_BASE}/admin_change_delete.php`, {
+          data: { pass: ADMIN_PASS, id: item.id }
+        })
+        const res = await delRes.json()
+        if (res.ok) console.log(`Удалено: ${item.title} (ID: ${item.id})`)
+      }
+    } else {
+      if (DEBUG) console.log('Записей 3 или меньше, удаление не требуется.')
+    }
+  } catch (e) { console.error('Ошибка в блоке очистки:', e.message) }
 
   await browser.close()
 }
