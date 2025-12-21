@@ -12,6 +12,27 @@ const SEEN_FILE  = 'seen.json'
 const INCLUDE_RE = /(изменени[яе]\s+в\s+расписани[ие])/i
 const EXCLUDE_RE = /(экзамен|экзаменац|сесс(ия|ии)|олимпиад|конкурс)/i
 
+// Функция поиска PDF (усиленная версия)
+async function extractPdfUrl(page) {
+  return await page.evaluate(() => {
+    // 1. Ищем прямые ссылки на .pdf или скачивание
+    const anchors = Array.from(document.querySelectorAll('a[href]'));
+    const pdfLink = anchors.find(a => 
+      /\.pdf($|\?)/i.test(a.href) || 
+      /\/download\//i.test(a.href) || 
+      /\/attachment\//i.test(a.href) ||
+      /скачать/i.test(a.innerText)
+    );
+    if (pdfLink) return pdfLink.href;
+
+    // 2. Ищем во фреймах (иногда PDF встроен в просмотрщик)
+    const frame = document.querySelector('iframe[src*=".pdf"], embed[src*=".pdf"], object[data*=".pdf"]');
+    if (frame) return frame.src || frame.data;
+
+    return '';
+  });
+}
+
 function formatRussianTitle(title) {
   try {
     const months = {
@@ -35,27 +56,21 @@ function formatRussianTitle(title) {
 
 async function parseResponse(response, label) {
   const text = await response.text();
-  try { return JSON.parse(text); } catch (e) {
-    console.error(`Ошибка в ${label}: Сервер прислал не JSON. Текст: ${text.slice(0, 50)}`);
-    return { ok: false };
-  }
+  try { return JSON.parse(text); } catch (e) { return { ok: false }; }
 }
 
 async function main() {
   console.log('--- СТАРТ ГЛАВНОЙ ФУНКЦИИ ---');
-  
   const browser = await chromium.launch();
   const context = await browser.newContext(fs.existsSync('state.json') ? { storageState: 'state.json' } : {});
   const page = await context.newPage();
 
   try {
-    console.log('Загрузка списка с вашего сайта для проверки...');
     const listRes = await context.request.get(`${SITE_BASE_RAW}/admin_change_list.php`, { params: { pass: ADMIN_PASS } });
-    const currentData = await parseResponse(listRes, 'Первичная проверка списка');
+    const currentData = await parseResponse(listRes, 'Проверка списка');
     const isSiteEmpty = !currentData.items || currentData.items.length === 0;
 
-    console.log('Перехожу на сайт колледжа...');
-    await page.goto(DASHBOARD_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+    await page.goto(DASHBOARD_URL, { waitUntil: 'networkidle', timeout: 60000 });
     await page.waitForTimeout(5000);
 
     const links = await page.evaluate(() => {
@@ -64,47 +79,40 @@ async function main() {
     });
 
     console.log(`Найдено ссылок на новости: ${links.length}`);
-
-    // Если на сайте пусто, мы игнорируем "seen.json" и обрабатываем всё заново
-    const seen = isSiteEmpty ? { ids: [] } : (JSON.parse(fs.readFileSync(SEEN_FILE, 'utf-8').catch(() => '{"ids":[]}')));
-    const toProcess = links.filter(h => !seen.ids.includes(h)).slice(0, 5);
-
-    console.log(`Будет обработано новостей: ${toProcess.length}`);
+    const toProcess = links.slice(0, 10); 
 
     for (const url of toProcess) {
-      console.log(`Открываю новость: ${url}`);
       const p = await context.newPage();
       try {
-        await p.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+        await p.goto(url, { waitUntil: 'networkidle', timeout: 30000 });
         const title = (await p.innerText('h1, h2, .title, .news-title').catch(() => '')).trim();
-        console.log(`Заголовок: "${title}"`);
+        
+        if (INCLUDE_RE.test(title) && !EXCLUDE_RE.test(title)) {
+           console.log(`Проверяю подходящую новость: "${title}"`);
+           const pdf = await extractPdfUrl(p);
 
-        const pdf = await p.evaluate(() => {
-          const a = document.querySelector('a[href*=".pdf"]');
-          return a ? a.href : '';
-        });
-
-        if (pdf && INCLUDE_RE.test(title) && !EXCLUDE_RE.test(title)) {
-          const prettyTitle = formatRussianTitle(title);
-          console.log(`✅ Найдено расписание! PDF: ${pdf}. Название: ${prettyTitle}`);
-          
-          const pdfResp = await context.request.get(pdf);
-          const buf = await pdfResp.body();
-          
-          const upRes = await context.request.post(`${SITE_BASE_RAW}/admin_upload_pdf.php`, {
-            data: { pass: ADMIN_PASS, data: buf.toString('base64'), name: `change_${Date.now()}` }
-          });
-          const up = await parseResponse(upRes, 'Загрузка PDF');
-          
-          if (up.ok && up.url) {
-            const addRes = await context.request.post(`${SITE_BASE_RAW}/admin_change_add.php`, {
-              data: { pass: ADMIN_PASS, title: prettyTitle, url: up.url, source: url }
-            });
-            const add = await parseResponse(addRes, 'Добавление');
-            if (add.ok) console.log(`🚀 УСПЕШНО ДОБАВЛЕНО: ${prettyTitle}`);
-          }
-        } else {
-          console.log(`❌ Пропускаю (не подходит по фильтру или нет PDF)`);
+           if (pdf) {
+              const prettyTitle = formatRussianTitle(title);
+              console.log(`✅ PDF найден: ${pdf}. Загружаю как "${prettyTitle}"`);
+              
+              const pdfResp = await context.request.get(pdf);
+              const buf = await pdfResp.body();
+              
+              const upRes = await context.request.post(`${SITE_BASE_RAW}/admin_upload_pdf.php`, {
+                data: { pass: ADMIN_PASS, data: buf.toString('base64'), name: `change_${Date.now()}` }
+              });
+              const up = await parseResponse(upRes, 'Загрузка PDF');
+              
+              if (up.ok && up.url) {
+                const addRes = await context.request.post(`${SITE_BASE_RAW}/admin_change_add.php`, {
+                  data: { pass: ADMIN_PASS, title: prettyTitle, url: up.url, source: url }
+                });
+                const add = await parseResponse(addRes, 'Добавление');
+                if (add.ok) console.log(`🚀 УСПЕШНО ДОБАВЛЕНО: ${prettyTitle}`);
+              }
+           } else {
+              console.log(`❌ Не удалось найти ссылку на PDF внутри новости ${url}`);
+           }
         }
       } catch (e) { console.error(`Ошибка страницы ${url}: ${e.message}`); }
       await p.close();
