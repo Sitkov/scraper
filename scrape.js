@@ -18,6 +18,7 @@ function formatRussianTitle(title) {
       'июля': 6, 'августа': 7, 'сентября': 8, 'октября': 9, 'ноября': 10, 'декабря': 11
     };
     const days = ['Воскресенье', 'Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота'];
+
     const match = title.match(/(\d{1,2})\s+([а-яё]+)/i);
     if (match) {
       const dayNum = parseInt(match[1]);
@@ -25,11 +26,14 @@ function formatRussianTitle(title) {
       if (months.hasOwnProperty(monthStr)) {
         const year = new Date().getFullYear();
         const dateObj = new Date(year, months[monthStr], dayNum);
-        return `Изменения - ${days[dateObj.getDay()]} - ${dayNum} ${monthStr}`;
+        const dayName = days[dateObj.getDay()];
+        
+        // ТОЛЬКО День недели и Дата
+        return `${dayName} - ${dayNum} ${monthStr}`;
       }
     }
   } catch (e) {}
-  return `Изменения - ${title}`;
+  return title; // Если не распознали, оставим как есть
 }
 
 async function parseResponse(response, label) {
