@@ -1,7 +1,7 @@
 name: EKTC Scraper
 on:
   schedule:
-    - cron: "*/15 * * * *" # Каждые 15 минут
+    - cron: "*/15 * * * *"
   workflow_dispatch: {}
 
 jobs:
@@ -9,28 +9,31 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-node@v4
         with:
           node-version: 20
 
       - name: Setup and Install
         run: |
-          # Создаем package.json принудительно, чтобы точно был нужный тип и зависимости
           echo '{"type":"module","dependencies":{"playwright":"1.49.0"}}' > package.json
           npm install
           npx playwright install --with-deps chromium
 
       - name: Restore state.json
         env:
-          # Если ваш секрет - это обычный текст JSON, используем его напрямую
-          STATE_JSON: ${{ secrets.STATE_JSON }}
+          # Пробуем оба варианта секрета
+          S_PLAIN: ${{ secrets.STATE_JSON }}
+          S_B64:   ${{ secrets.STATE_JSON_B64 }}
         run: |
-          if [ -z "$STATE_JSON" ]; then
-            echo "STATE_JSON is empty!"
+          if [ ! -z "$S_PLAIN" ]; then
+            echo "$S_PLAIN" > state.json
+            echo "✅ state.json создан из обычного текста"
+          elif [ ! -z "$S_B64" ]; then
+            echo "$S_B64" | base64 -d > state.json
+            echo "✅ state.json создан из Base64"
           else
-            echo "$STATE_JSON" > state.json
-            echo "state.json created"
+            echo "❌ ОШИБКА: Секрет не найден! Проверьте имена в Settings -> Secrets"
+            exit 1
           fi
 
       - name: Run scraper
