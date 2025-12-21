@@ -28,12 +28,12 @@ function formatRussianTitle(title) {
         const dateObj = new Date(year, months[monthStr], dayNum);
         const dayName = days[dateObj.getDay()];
         
-        // ТОЛЬКО День недели и Дата
-        return `📝 ${dayName} - ${dayNum} ${monthStr}`;
+        // Добавляем смайлик 📅 в начало
+        return `📅 ${dayName} - ${dayNum} ${monthStr}`;
       }
     }
   } catch (e) {}
-  return title; // Если не распознали, оставим как есть
+  return `📅 ${title}`;
 }
 
 async function parseResponse(response, label) {
