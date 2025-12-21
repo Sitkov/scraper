@@ -29,7 +29,7 @@ function formatRussianTitle(title) {
         const dayName = days[dateObj.getDay()];
         
         // ТОЛЬКО День недели и Дата
-        return `${dayName} - ${dayNum} ${monthStr}`;
+        return `📝 ${dayName} - ${dayNum} ${monthStr}`;
       }
     }
   } catch (e) {}
