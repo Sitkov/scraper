@@ -1,17 +1,14 @@
 import { chromium } from 'playwright'
 import fs from 'fs'
 
-console.log('--- ИНИЦИАЛИЗАЦИЯ СКРИПТА ---');
-
 const DASHBOARD_URL = 'https://t15.ecp.egov66.ru/dashboard'
 const SITE_BASE_RAW = (process.env.SITE_BASE || '').trim().replace(/\/+$/, '')
 const ADMIN_PASS    = (process.env.ADMIN_PASS || '').trim()
-const MAX_KEEP      = 3; // Лимит записей на сайте
+const MAX_KEEP      = 3;
 
 const INCLUDE_RE = /(изменени[яе]\s+в\s+расписани[ие])/i
 const EXCLUDE_RE = /(экзамен|экзаменац|сесс(ия|ии)|олимпиад|конкурс)/i
 
-// Функция для красивого названия (📅 День недели - Число Месяц)
 function formatRussianTitle(title) {
   try {
     const months = {
@@ -39,20 +36,19 @@ async function parseResponse(response, label) {
 }
 
 async function main() {
-  console.log('--- СТАРТ ГЛАВНОЙ ФУНКЦИИ ---');
-  if (!SITE_BASE_RAW || !ADMIN_PASS) {
-    console.error('Ошибка: SITE_BASE или ADMIN_PASS не заданы в Secrets!');
-    process.exit(1);
-  }
-
   const browser = await chromium.launch();
   const context = await browser.newContext({
     storageState: fs.existsSync('state.json') ? 'state.json' : undefined,
-    acceptDownloads: true // Разрешаем скачивание файлов
+    acceptDownloads: true
   });
   const page = await context.newPage();
 
   try {
+    // 1. ПОЛУЧАЕМ ТЕКУЩИЙ СПИСОК С ТВОЕГО САЙТА (ЧТОБЫ НЕ ДУБЛИРОВАТЬ УВЕДЫ)
+    const listRes = await context.request.get(`${SITE_BASE_RAW}/admin_change_list.php`, { params: { pass: ADMIN_PASS } });
+    const remoteData = await parseResponse(listRes, 'Загрузка текущего списка');
+    const existingTitles = new Set((remoteData.items || []).map(it => it.title));
+
     console.log('Захожу на сайт колледжа...');
     await page.goto(DASHBOARD_URL, { waitUntil: 'networkidle', timeout: 60000 });
     
@@ -61,63 +57,70 @@ async function main() {
         .map(a => a.href).filter(h => /\/news\/show\/\d+$/i.test(h))));
     });
 
-    console.log(`Найдено новостей на портале: ${links.length}`);
     const toProcess = links.slice(0, 10); 
+    let addedAnything = false;
+    let lastAddedTitle = "";
 
     for (const url of toProcess) {
       const p = await context.newPage();
       try {
-        await p.goto(url, { waitUntil: 'networkidle', timeout: 60000 });
+        await p.goto(url, { waitUntil: 'networkidle', timeout: 40000 });
         const title = (await p.innerText('h1, h2, .title, .news-title').catch(() => '')).trim();
         
         if (INCLUDE_RE.test(title) && !EXCLUDE_RE.test(title)) {
+           const prettyTitle = formatRussianTitle(title);
+           
+           // ЕСЛИ ТАКОЙ ЗАГОЛОВОК УЖЕ ЕСТЬ НА САЙТЕ - ИГНОРИРУЕМ ПОЛНОСТЬЮ
+           if (existingTitles.has(prettyTitle)) {
+             console.log(`Уже есть на сайте: ${prettyTitle}`);
+             continue;
+           }
+
            const pdfSelector = 'a[href*=".pdf"], a[href*="/download/"]';
            const hasPdf = await p.$(pdfSelector);
 
            if (hasPdf) {
-              const prettyTitle = formatRussianTitle(title);
-              console.log(`✅ Нашел расписание: "${prettyTitle}"`);
-
-              // Стабильное скачивание через событие 'download'
+              console.log(`✅ Нашел новое: "${prettyTitle}"`);
               const downloadPromise = p.waitForEvent('download');
               await p.click(pdfSelector); 
               const download = await downloadPromise;
-              const downloadPath = await download.path();
-              const buf = fs.readFileSync(downloadPath);
+              const buf = fs.readFileSync(await download.path());
               
               if (buf && buf.length > 1000) {
-                // 1. Грузим PDF на хостинг
                 const upRes = await context.request.post(`${SITE_BASE_RAW}/admin_upload_pdf.php`, {
                   data: { pass: ADMIN_PASS, data: buf.toString('base64'), name: `change_${Date.now()}` }
                 });
                 const up = await parseResponse(upRes, 'Загрузка PDF');
                 
                 if (up.ok && up.url) {
-                  // 2. Добавляем запись в базу сайта
                   const addRes = await context.request.post(`${SITE_BASE_RAW}/admin_change_add.php`, {
                     data: { pass: ADMIN_PASS, title: prettyTitle, url: up.url, source: url }
                   });
                   const add = await parseResponse(addRes, 'Добавление');
-                  
                   if (add.ok && add.added) {
-                    console.log(`🚀 УСПЕШНО ДОБАВЛЕНО: ${prettyTitle}`);
-                    // 3. Отправляем уведомление в Телеграм
-                    await context.request.post(`${SITE_BASE_RAW}/admin_broadcast.php`, {
-                      data: { pass: ADMIN_PASS, text: `🔔 Новое изменение!\n\n${prettyTitle}` }
-                    }).catch(() => {});
+                    console.log(`🚀 ДОБАВЛЕНО: ${prettyTitle}`);
+                    addedAnything = true;
+                    lastAddedTitle = prettyTitle;
                   }
                 }
               }
            }
         }
-      } catch (e) { console.error(`Ошибка новости ${url}: ${e.message}`); }
+      } catch (e) { console.error(`Ошибка: ${e.message}`); }
       await p.close();
     }
+
+    // ОТПРАВЛЯЕМ УВЕДОМЛЕНИЕ ТОЛЬКО ОДИН РАЗ (о самом свежем)
+    if (addedAnything) {
+        await context.request.post(`${SITE_BASE_RAW}/admin_broadcast.php`, {
+          data: { pass: ADMIN_PASS, text: `🔔 Новое изменение!\n\n${lastAddedTitle}` }
+        }).catch(() => {});
+    }
+
   } catch (err) { console.error('Критическая ошибка:', err.message); }
 
-  // --- БЛОК 1: ОЧИСТКА БАЗЫ НА САЙТЕ (оставляем только 3) ---
+  // Очистка сайта
   try {
-    console.log('Проверка лимита записей на сайте...');
     const listRes = await context.request.get(`${SITE_BASE_RAW}/admin_change_list.php`, { params: { pass: ADMIN_PASS } });
     const data = await parseResponse(listRes, 'Очистка');
     if (data && Array.isArray(data.items)) {
@@ -126,25 +129,16 @@ async function main() {
         for (const item of items.slice(MAX_KEEP)) {
           await context.request.post(`${SITE_BASE_RAW}/admin_change_delete.php`, { data: { pass: ADMIN_PASS, id: item.id } });
         }
-        console.log('Лишние записи удалены с сайта.');
       }
     }
   } catch (e) {}
 
-  // --- БЛОК 2: АВТО-УДАЛЕНИЕ СТАРЫХ УВЕДОМЛЕНИЙ В ТГ (через 40 часов) ---
+  // Очистка старых уведомлений в ТГ
   try {
-    console.log('Запуск авто-очистки уведомлений в Telegram...');
-    const cleanupRes = await context.request.get(`${SITE_BASE_RAW}/admin_auto_cleanup.php`, { 
-      params: { pass: ADMIN_PASS } 
-    });
-    const cleanData = await parseResponse(cleanupRes, 'Авто-очистка ТГ');
-    if (cleanData.ok) console.log(`Авто-очистка ТГ завершена. Удалено сообщений: ${cleanData.auto_deleted || 0}`);
-  } catch (e) {
-    console.error('Ошибка авто-очистки ТГ:', e.message);
-  }
+    await context.request.get(`${SITE_BASE_RAW}/admin_auto_cleanup.php`, { params: { pass: ADMIN_PASS } });
+  } catch (e) {}
 
   await browser.close();
-  console.log('--- СКРИПТ ЗАВЕРШЕН ---');
 }
 
-main().catch(e => { console.error(e); process.exit(1); });
+main().catch(e => { process.exit(1); });
