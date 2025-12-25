@@ -11,134 +11,79 @@ const EXCLUDE_RE = /(экзамен|экзаменац|сесс(ия|ии)|ол�
 
 function formatRussianTitle(title) {
   try {
-    const months = {
-      'января': 0, 'февраля': 1, 'марта': 2, 'апреля': 3, 'мая': 4, 'июня': 5,
-      'июля': 6, 'августа': 7, 'сентября': 8, 'октября': 9, 'ноября': 10, 'декабря': 11
-    };
+    const months = {'января': 0, 'февраля': 1, 'марта': 2, 'апреля': 3, 'мая': 4, 'июня': 5, 'июля': 6, 'августа': 7, 'сентября': 8, 'октября': 9, 'ноября': 10, 'декабря': 11};
     const days = ['Воскресенье', 'Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота'];
     const match = title.match(/(\d{1,2})\s+([а-яё]+)/i);
     if (match) {
       const dayNum = parseInt(match[1]);
       const monthStr = match[2].toLowerCase();
-      if (months.hasOwnProperty(monthStr)) {
-        const year = new Date().getFullYear();
-        const dateObj = new Date(year, months[monthStr], dayNum);
-        return `📅 ${days[dateObj.getDay()]} - ${dayNum} ${monthStr}`;
-      }
+      const dateObj = new Date(new Date().getFullYear(), months[monthStr], dayNum);
+      return `📅 ${days[dateObj.getDay()]} - ${dayNum} ${monthStr}`;
     }
   } catch (e) {}
   return `📅 ${title}`;
 }
 
-async function parseResponse(response, label) {
-  const text = await response.text();
-  try { return JSON.parse(text); } catch (e) { return { ok: false }; }
-}
-
 async function main() {
   const browser = await chromium.launch();
-  const context = await browser.newContext({
-    storageState: fs.existsSync('state.json') ? 'state.json' : undefined,
-    acceptDownloads: true
-  });
+  const context = await browser.newContext({ storageState: fs.existsSync('state.json') ? 'state.json' : undefined, acceptDownloads: true });
   const page = await context.newPage();
 
   try {
-    // 1. ПОЛУЧАЕМ ТЕКУЩИЙ СПИСОК С ТВОЕГО САЙТА (ЧТОБЫ НЕ ДУБЛИРОВАТЬ УВЕДЫ)
-    const listRes = await context.request.get(`${SITE_BASE_RAW}/admin_change_list.php`, { params: { pass: ADMIN_PASS } });
-    const remoteData = await parseResponse(listRes, 'Загрузка текущего списка');
-    const existingTitles = new Set((remoteData.items || []).map(it => it.title));
-
-    console.log('Захожу на сайт колледжа...');
+    console.log('Поиск новостей на портале...');
     await page.goto(DASHBOARD_URL, { waitUntil: 'networkidle', timeout: 60000 });
-    
-    const links = await page.evaluate(() => {
-      return Array.from(new Set(Array.from(document.querySelectorAll('a[href]'))
-        .map(a => a.href).filter(h => /\/news\/show\/\d+$/i.test(h))));
-    });
+    const links = await page.evaluate(() => Array.from(new Set(Array.from(document.querySelectorAll('a[href]')).map(a => a.href).filter(h => /\/news\/show\/\d+$/i.test(h)))));
 
-    const toProcess = links.slice(0, 10); 
-    let addedAnything = false;
-    let lastAddedTitle = "";
-
-    for (const url of toProcess) {
+    // Обрабатываем новости от старых к новым (чтобы лимит в 3 записи работал корректно)
+    for (const url of links.reverse().slice(-10)) {
       const p = await context.newPage();
       try {
-        await p.goto(url, { waitUntil: 'networkidle', timeout: 40000 });
-        const title = (await p.innerText('h1, h2, .title, .news-title').catch(() => '')).trim();
+        await p.goto(url, { waitUntil: 'networkidle', timeout: 30000 });
+        const title = (await p.innerText('h1, h2, .title').catch(() => '')).trim();
         
         if (INCLUDE_RE.test(title) && !EXCLUDE_RE.test(title)) {
-           const prettyTitle = formatRussianTitle(title);
-           
-           // ЕСЛИ ТАКОЙ ЗАГОЛОВОК УЖЕ ЕСТЬ НА САЙТЕ - ИГНОРИРУЕМ ПОЛНОСТЬЮ
-           if (existingTitles.has(prettyTitle)) {
-             console.log(`Уже есть на сайте: ${prettyTitle}`);
-             continue;
-           }
-
            const pdfSelector = 'a[href*=".pdf"], a[href*="/download/"]';
-           const hasPdf = await p.$(pdfSelector);
-
-           if (hasPdf) {
-              console.log(`✅ Нашел новое: "${prettyTitle}"`);
-              const downloadPromise = p.waitForEvent('download');
-              await p.click(pdfSelector); 
-              const download = await downloadPromise;
-              const buf = fs.readFileSync(await download.path());
+           if (await p.$(pdfSelector)) {
+              const prettyTitle = formatRussianTitle(title);
+              const download = await (async () => {
+                const [d] = await Promise.all([p.waitForEvent('download'), p.click(pdfSelector)]);
+                return d;
+              })();
               
-              if (buf && buf.length > 1000) {
-                const upRes = await context.request.post(`${SITE_BASE_RAW}/admin_upload_pdf.php`, {
-                  data: { pass: ADMIN_PASS, data: buf.toString('base64'), name: `change_${Date.now()}` }
-                });
-                const up = await parseResponse(upRes, 'Загрузка PDF');
+              const buf = fs.readFileSync(await download.path());
+              if (buf.length > 1000) {
+                // Грузим PDF
+                const upRes = await context.request.post(`${SITE_BASE_RAW}/admin_upload_pdf.php`, { data: { pass: ADMIN_PASS, data: buf.toString('base64'), name: `change_${Date.now()}` } });
+                const up = await upRes.json().catch(() => ({}));
                 
                 if (up.ok && up.url) {
+                  // Пытаемся добавить. PHP сам решит, слать уведомление или нет!
                   const addRes = await context.request.post(`${SITE_BASE_RAW}/admin_change_add.php`, {
                     data: { pass: ADMIN_PASS, title: prettyTitle, url: up.url, source: url }
                   });
-                  const add = await parseResponse(addRes, 'Добавление');
-                  if (add.ok && add.added) {
-                    console.log(`🚀 ДОБАВЛЕНО: ${prettyTitle}`);
-                    addedAnything = true;
-                    lastAddedTitle = prettyTitle;
-                  }
+                  const add = await addRes.json().catch(() => ({}));
+                  if (add.added) console.log(`🚀 Реально новая новость: ${prettyTitle}`);
+                  else console.log(`Уже было на сайте: ${prettyTitle}`);
                 }
               }
            }
         }
-      } catch (e) { console.error(`Ошибка: ${e.message}`); }
+      } catch (e) {}
       await p.close();
     }
+  } catch (err) { console.error('Ошибка:', err.message); }
 
-    // ОТПРАВЛЯЕМ УВЕДОМЛЕНИЕ ТОЛЬКО ОДИН РАЗ (о самом свежем)
-    if (addedAnything) {
-        await context.request.post(`${SITE_BASE_RAW}/admin_broadcast.php`, {
-          data: { pass: ADMIN_PASS, text: `🔔 Новое изменение!\n\n${lastAddedTitle}` }
-        }).catch(() => {});
-    }
-
-  } catch (err) { console.error('Критическая ошибка:', err.message); }
-
-  // Очистка сайта
-  try {
-    const listRes = await context.request.get(`${SITE_BASE_RAW}/admin_change_list.php`, { params: { pass: ADMIN_PASS } });
-    const data = await parseResponse(listRes, 'Очистка');
-    if (data && Array.isArray(data.items)) {
-      let items = data.items.sort((a, b) => b.id - a.id);
-      if (items.length > MAX_KEEP) {
-        for (const item of items.slice(MAX_KEEP)) {
-          await context.request.post(`${SITE_BASE_RAW}/admin_change_delete.php`, { data: { pass: ADMIN_PASS, id: item.id } });
-        }
+  // Очистка сайта (оставляем 3) и ТГ (40 часов)
+  await context.request.get(`${SITE_BASE_RAW}/admin_change_list.php`, { params: { pass: ADMIN_PASS } }).then(async r => {
+    const data = await r.json();
+    if (data.items && data.items.length > MAX_KEEP) {
+      for (const it of data.items.sort((a,b) => b.id - a.id).slice(MAX_KEEP)) {
+        await context.request.post(`${SITE_BASE_RAW}/admin_change_delete.php`, { data: { pass: ADMIN_PASS, id: it.id } });
       }
     }
-  } catch (e) {}
-
-  // Очистка старых уведомлений в ТГ
-  try {
-    await context.request.get(`${SITE_BASE_RAW}/admin_auto_cleanup.php`, { params: { pass: ADMIN_PASS } });
-  } catch (e) {}
+  }).catch(() => {});
+  await context.request.get(`${SITE_BASE_RAW}/admin_auto_cleanup.php`, { params: { pass: ADMIN_PASS } }).catch(() => {});
 
   await browser.close();
 }
-
-main().catch(e => { process.exit(1); });
+main().catch(() => process.exit(1));
