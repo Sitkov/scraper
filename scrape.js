@@ -1,14 +1,13 @@
 import { chromium } from 'playwright'
 import fs from 'fs'
 
-console.log('--- СТАРТ СКРИПТА (ВЕРСИЯ: ТОП-3 И ДНИ НЕДЕЛИ) ---');
+console.log('--- ЗАПУСК СКРИПТА (ВЕРСИЯ: ГЛУБОКИЙ ПОИСК И ДЕБАГ) ---');
 
 const DASHBOARD_URL = 'https://t15.ecp.egov66.ru/dashboard'
 const SITE_BASE_RAW = (process.env.SITE_BASE || '').trim().replace(/\/+$/, '')
 const ADMIN_PASS    = (process.env.ADMIN_PASS || '').trim()
-const MAX_KEEP      = 3; // СТРОГО 3 ЗАПИСИ
+const MAX_KEEP      = 3;
 
-// Функция для превращения "22 декабря" в "📅 Понедельник - 22 декабря"
 function formatRussianTitle(title) {
     try {
         const months = {'января': 0, 'февраля': 1, 'марта': 2, 'апреля': 3, 'мая': 4, 'июня': 5, 'июля': 6, 'августа': 7, 'сентября': 8, 'октября': 9, 'ноября': 10, 'декабря': 11};
@@ -20,15 +19,13 @@ function formatRussianTitle(title) {
             if (months.hasOwnProperty(monthStr)) {
                 const now = new Date();
                 const dateObj = new Date(now.getFullYear(), months[monthStr], dayNum);
-                const dayName = days[dateObj.getDay()];
-                return `📅 ${dayName} - ${dayNum} ${monthStr}`;
+                return `📅 ${days[dateObj.getDay()]} - ${dayNum} ${monthStr}`;
             }
         }
     } catch (e) {}
     return `📅 ${title}`;
 }
 
-// Проверка: новость опубликована не более 2 дней назад
 function getFreshness(title) {
     const months = {'января': 0, 'февраля': 1, 'марта': 2, 'апреля': 3, 'мая': 4, 'июня': 5, 'июля': 6, 'августа': 7, 'сентября': 8, 'октября': 9, 'ноября': 10, 'декабря': 11};
     const match = title.match(/(\d{1,2})\s+([а-яё]+)/i);
@@ -37,7 +34,8 @@ function getFreshness(title) {
     const month = months[match[2].toLowerCase()];
     const newsDate = new Date(new Date().getFullYear(), month, day);
     const diffDays = (new Date() - newsDate) / (1000 * 3600 * 24);
-    return diffDays < 2; 
+    // Пропускаем если новость из будущего (даты > сегодня) или не старее 3 дней
+    return diffDays < 3; 
 }
 
 async function parseResponse(response, label) {
@@ -51,72 +49,87 @@ async function main() {
     const page = await context.newPage();
 
     try {
-        console.log('Проверка портала...');
+        console.log('Загрузка портала...');
         await page.goto(DASHBOARD_URL, { waitUntil: 'networkidle', timeout: 60000 });
+        
+        // Берем больше ссылок, чтобы не пропустить из-за объявлений
         const links = await page.evaluate(() => Array.from(new Set(Array.from(document.querySelectorAll('a[href]')).map(a => a.href).filter(h => /\/news\/show\/\d+$/i.test(h)))));
+        console.log(`Всего новостей на странице: ${links.length}`);
 
         let lastPrettyTitle = null;
 
-        for (const url of links.slice(0, 5)) {
+        // Проверяем первые 15 новостей
+        for (const url of links.slice(0, 15)) {
             const p = await context.newPage();
             try {
                 await p.goto(url, { waitUntil: 'networkidle', timeout: 30000 });
-                const title = (await p.innerText('h1, h2, .title').catch(() => '')).trim();
+                const title = (await p.innerText('h1, h2, .title, .news-title').catch(() => '')).trim();
                 
-                if (title.toLowerCase().includes('изменени') && getFreshness(title)) {
-                    const prettyTitle = formatRussianTitle(title);
-                    const pdfSelector = 'a[href*=".pdf"], a[href*="/download/"]';
+                if (!title.toLowerCase().includes('изменени')) {
+                    console.log(`[Пропуск] Не расписание: "${title}"`);
+                } else if (!getFreshness(title)) {
+                    console.log(`[Пропуск] Старая новость: "${title}"`);
+                } else {
+                    const pdfSelector = 'a[href*=".pdf"], a[href*="/download/"], a[href*="attachment"]';
+                    const pdfElement = await p.$(pdfSelector);
                     
-                    if (await p.$(pdfSelector)) {
-                        const download = await Promise.all([p.waitForEvent('download'), p.click(pdfSelector)]).then(v => v[0]);
+                    if (pdfElement) {
+                        const prettyTitle = formatRussianTitle(title);
+                        const download = await (async () => {
+                            const [d] = await Promise.all([p.waitForEvent('download'), p.click(pdfSelector)]);
+                            return d;
+                        })();
+                        
                         const buf = fs.readFileSync(await download.path());
-                        
-                        const upRes = await context.request.post(`${SITE_BASE_RAW}/admin_upload_pdf.php`, { data: { pass: ADMIN_PASS, data: buf.toString('base64'), name: `change_${Date.now()}` } });
-                        const up = await upRes.json().catch(() => ({}));
-                        
-                        if (up.ok && up.url) {
-                            const addRes = await context.request.post(`${SITE_BASE_RAW}/admin_change_add.php`, {
-                                data: { pass: ADMIN_PASS, title: prettyTitle, url: up.url, source: url }
-                            });
-                            const add = await addRes.json().catch(() => ({}));
-                            if (add.added) {
-                                console.log(`Добавлено: ${prettyTitle}`);
-                                lastPrettyTitle = prettyTitle;
+                        if (buf.length > 1000) {
+                            const upRes = await context.request.post(`${SITE_BASE_RAW}/admin_upload_pdf.php`, { data: { pass: ADMIN_PASS, data: buf.toString('base64'), name: `change_${Date.now()}` } });
+                            const up = await upRes.json().catch(() => ({}));
+                            
+                            if (up.ok && up.url) {
+                                const addRes = await context.request.post(`${SITE_BASE_RAW}/admin_change_add.php`, {
+                                    data: { pass: ADMIN_PASS, title: prettyTitle, url: up.url, source: url }
+                                });
+                                const add = await addRes.json().catch(() => ({}));
+                                if (add.added) {
+                                    console.log(`✅ ДОБАВЛЕНО: ${prettyTitle}`);
+                                    lastPrettyTitle = prettyTitle;
+                                } else {
+                                    console.log(`[Ок] Уже есть на сайте: ${prettyTitle}`);
+                                }
                             }
                         }
+                    } else {
+                        console.log(`[⚠️ Ошибка] В новости "${title}" не найден файл PDF!`);
                     }
                 }
-            } catch (e) {}
+            } catch (e) {
+                console.log(`[Ошибка] Не удалось открыть ${url}`);
+            }
             await p.close();
         }
 
-        // Если добавили что-то новое, шлем ОДНО уведомление
         if (lastPrettyTitle) {
             await context.request.post(`${SITE_BASE_RAW}/admin_broadcast.php`, {
                 data: { pass: ADMIN_PASS, text: `🔔 Новое изменение!\n\n${lastPrettyTitle}` }
             });
         }
 
-    } catch (err) { console.error('Ошибка:', err.message); }
+    } catch (err) { console.error('Критическая ошибка:', err.message); }
 
-    // --- ЖЕСТКАЯ ОЧИСТКА: ОСТАВЛЯЕМ ТОЛЬКО 3 ЗАПИСИ ---
+    // Чистка сайта (MAX 3)
     try {
-        console.log('Очистка лишних записей с сайта...');
         const listRes = await context.request.get(`${SITE_BASE_RAW}/admin_change_list.php`, { params: { pass: ADMIN_PASS } });
         const data = await listRes.json();
         if (data.items && data.items.length > MAX_KEEP) {
-            // Сортируем: новые ID (таймстампы) сверху
             const toDelete = data.items.sort((a, b) => b.id - a.id).slice(MAX_KEEP);
             for (const it of toDelete) {
                 await context.request.post(`${SITE_BASE_RAW}/admin_change_delete.php`, { data: { pass: ADMIN_PASS, id: it.id } });
-                console.log(`Удалено старое: ${it.title}`);
+                console.log(`Удалено из базы: ${it.title}`);
             }
         }
-    } catch (e) { console.log('Ошибка очистки:', e.message); }
+    } catch (e) {}
 
-    // Очистка уведомлений в ТГ (старше 40 часов)
     await context.request.get(`${SITE_BASE_RAW}/admin_auto_cleanup.php`, { params: { pass: ADMIN_PASS } }).catch(() => {});
-
     await browser.close();
     console.log('--- РАБОТА ЗАВЕРШЕНА ---');
 }
