@@ -11,9 +11,7 @@ const MAX_KEEP      = 3;
 const monthsArr = ['января', 'февраля', 'марта', 'апреля', 'мая', 'июня', 'июля', 'августа', 'сентября', 'октября', 'ноября', 'декабря'];
 const daysArr = ['Воскресенье', 'Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота'];
 
-// Универсальная функция извлечения даты из заголовка
 function parseNewsDate(title) {
-    // 1. Пробуем формат "21 января"
     let match = title.match(/(\d{1,2})\s+([а-яё]+)/i);
     if (match) {
         const day = parseInt(match[1]);
@@ -21,13 +19,10 @@ function parseNewsDate(title) {
         const monthIdx = monthsArr.findIndex(m => monthStr.startsWith(m.slice(0, 3)));
         if (monthIdx !== -1) return { day, month: monthIdx };
     }
-
-    // 2. Пробуем формат "21.01.2026" или "21.01"
     match = title.match(/(\d{1,2})\.(\d{1,2})/);
     if (match) {
         return { day: parseInt(match[1]), month: parseInt(match[2]) - 1 };
     }
-
     return null;
 }
 
@@ -44,24 +39,32 @@ function formatRussianTitle(title) {
 
 function getFreshness(title) {
     const dateInfo = parseNewsDate(title);
-    if (!dateInfo) return true; // Если дату не поняли, лучше проверить новость, чем пропустить
-
+    if (!dateInfo) return true;
     const now = new Date();
     const newsDate = new Date(now.getFullYear(), dateInfo.month, dateInfo.day);
-    
-    // Считаем разницу (используем Math.abs, чтобы даты "на завтра" были свежими)
     const diffDays = Math.abs(now - newsDate) / (1000 * 3600 * 24);
     return diffDays < 3; 
 }
 
+async function parseResponse(response, label) {
+    const text = await response.text();
+    try { return JSON.parse(text); } catch (e) { return { ok: false }; }
+}
+
 async function main() {
     const browser = await chromium.launch();
-    const context = await browser.newContext({ storageState: fs.existsSync('state.json') ? 'state.json' : undefined, acceptDownloads: true });
+    const context = await browser.newContext({ 
+        storageState: fs.existsSync('state.json') ? 'state.json' : undefined, 
+        acceptDownloads: true,
+        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    });
     const page = await context.newPage();
 
     try {
         console.log('Загрузка портала...');
-        await page.goto(DASHBOARD_URL, { waitUntil: 'networkidle', timeout: 60000 });
+        // Для главной страницы используем обычную загрузку
+        await page.goto(DASHBOARD_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+        await page.waitForTimeout(3000);
         
         const links = await page.evaluate(() => Array.from(new Set(Array.from(document.querySelectorAll('a[href]')).map(a => a.href).filter(h => /\/news\/show\/\d+$/i.test(h)))));
         console.log(`Всего новостей: ${links.length}`);
@@ -71,7 +74,10 @@ async function main() {
         for (const url of links.slice(0, 10)) {
             const p = await context.newPage();
             try {
-                await p.goto(url, { waitUntil: 'networkidle', timeout: 30000 });
+                // ПЕРЕШЛИ НА domcontentloaded И УВЕЛИЧИЛИ ТАЙМАУТ
+                await p.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+                await p.waitForTimeout(2000); // Ждем 2 сек на прогрузку скриптов внутри
+                
                 const title = (await p.innerText('h1, h2, .title, .news-title').catch(() => '')).trim();
                 
                 if (!title.toLowerCase().includes('изменени')) {
@@ -82,6 +88,8 @@ async function main() {
                     const pdfSelector = 'a[href*=".pdf"], a[href*="/download/"], a[href*="attachment"]';
                     if (await p.$(pdfSelector)) {
                         const prettyTitle = formatRussianTitle(title);
+                        console.log(`✅ Нашел PDF в: ${prettyTitle}`);
+
                         const download = await Promise.all([p.waitForEvent('download'), p.click(pdfSelector)]).then(v => v[0]);
                         const buf = fs.readFileSync(await download.path());
                         
@@ -95,7 +103,7 @@ async function main() {
                                 });
                                 const add = await addRes.json().catch(() => ({}));
                                 if (add.added) {
-                                    console.log(`✅ ДОБАВЛЕНО: ${prettyTitle}`);
+                                    console.log(`🚀 ДОБАВЛЕНО: ${prettyTitle}`);
                                     lastPrettyTitle = prettyTitle;
                                 } else {
                                     console.log(`[Ок] Уже есть на сайте: ${prettyTitle}`);
@@ -106,7 +114,9 @@ async function main() {
                         console.log(`[⚠️] PDF не найден в: ${title}`);
                     }
                 }
-            } catch (e) { console.log(`Ошибка страницы ${url}`); }
+            } catch (e) { 
+                console.log(`[!] Ошибка страницы ${url}: ${e.message.split('\n')[0]}`); 
+            }
             await p.close();
         }
 
@@ -116,9 +126,9 @@ async function main() {
             });
         }
 
-    } catch (err) { console.error('Ошибка:', err.message); }
+    } catch (err) { console.error('Критическая ошибка главной:', err.message); }
 
-    // Очистка сайта (оставляем 3)
+    // Очистка сайта
     try {
         const listRes = await context.request.get(`${SITE_BASE_RAW}/admin_change_list.php`, { params: { pass: ADMIN_PASS } });
         const data = await listRes.json();
@@ -130,9 +140,7 @@ async function main() {
         }
     } catch (e) {}
 
-    // Удаление из ТГ старых кнопок
     await context.request.get(`${SITE_BASE_RAW}/admin_auto_cleanup.php`, { params: { pass: ADMIN_PASS } }).catch(() => {});
-
     await browser.close();
 }
 main();
