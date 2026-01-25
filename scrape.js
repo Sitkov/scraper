@@ -1,7 +1,7 @@
 import { chromium } from 'playwright'
 import fs from 'fs'
 
-console.log('--- ЗАПУСК СКРИПТА (ВЕРСИЯ: КАЛЕНДАРНАЯ СОРТИРОВКА) ---');
+console.log('--- ЗАПУСК СКРИПТА (ПОЛНАЯ ВЕРСИЯ С КНОПКОЙ) ---');
 
 const DASHBOARD_URL = 'https://t15.ecp.egov66.ru/dashboard'
 const SITE_BASE_RAW = (process.env.SITE_BASE || '').trim().replace(/\/+$/, '')
@@ -12,18 +12,16 @@ const monthsMap = {'янв':1, 'фев':2, 'мар':3, 'апр':4, 'мая':5, '
 const monthsArr = ['января', 'февраля', 'марта', 'апреля', 'мая', 'июня', 'июля', 'августа', 'сентября', 'октября', 'ноября', 'декабря'];
 const daysArr = ['Воскресенье', 'Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота'];
 
-// Функция вычисления "веса" даты для сравнения (21 января = 121)
-function getDateWeight(title) {
+function parseNewsDate(title) {
     let match = title.match(/(\d{1,2})\s+([а-яё]+)/i);
     if (match) {
         const d = parseInt(match[1]);
-        const m = monthsMap[match[2].toLowerCase().slice(0, 3)] || 0;
+        const monthStr = match[2].toLowerCase().slice(0, 3);
+        const m = monthsMap[monthStr] || 0;
         return (m * 100) + d;
     }
     match = title.match(/(\d{1,2})\.(\d{1,2})/);
-    if (match) {
-        return (parseInt(match[2]) * 100) + parseInt(match[1]);
-    }
+    if (match) return (parseInt(match[2]) * 100) + parseInt(match[1]);
     return 0;
 }
 
@@ -50,94 +48,76 @@ async function main() {
     try {
         console.log('Загрузка портала...');
         await page.goto(DASHBOARD_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
-        await page.waitForTimeout(3000);
         
         const links = await page.evaluate(() => Array.from(new Set(Array.from(document.querySelectorAll('a[href]')).map(a => a.href).filter(h => /\/news\/show\/\d+$/i.test(h)))));
         
         let foundNews = [];
-
-        // 1. Сначала просто собираем данные о всех подходящих новостях
         for (const url of links.slice(0, 10)) {
             const p = await context.newPage();
             try {
                 await p.goto(url, { waitUntil: 'domcontentloaded', timeout: 40000 });
                 const title = (await p.innerText('h1, h2, .title').catch(() => '')).trim();
-                
                 if (title.toLowerCase().includes('изменени')) {
                     const pdfSelector = 'a[href*=".pdf"], a[href*="/download/"], a[href*="attachment"]';
-                    const hasPdf = await p.$(pdfSelector);
-                    if (hasPdf) {
-                        foundNews.push({
-                            title,
-                            url,
-                            pdfSelector,
-                            weight: getDateWeight(title),
-                            page: p // Оставляем страницу открытой на время скачивания
-                        });
-                        continue; // Не закрываем страницу пока что
+                    if (await p.$(pdfSelector)) {
+                        foundNews.push({ title, url, pdfSelector, weight: parseNewsDate(title), page: p });
+                        continue; 
                     }
                 }
             } catch (e) {}
             await p.close();
         }
 
-        // 2. Сортируем найденное по дате (от старых к новым)
         foundNews.sort((a, b) => a.weight - b.weight);
 
-        let addedCount = 0;
-        let lastAddedPrettyTitle = null;
+        let addedAnything = false;
+        let lastTitle = "";
 
-        // 3. Добавляем на сайт в правильном порядке
         for (const item of foundNews) {
-            try {
-                const download = await Promise.all([item.page.waitForEvent('download'), item.page.click(item.pdfSelector)]).then(v => v[0]);
-                const buf = fs.readFileSync(await download.path());
-                const prettyTitle = formatRussianTitle(item.title);
+            const download = await Promise.all([item.page.waitForEvent('download'), item.page.click(item.pdfSelector)]).then(v => v[0]);
+            const buf = fs.readFileSync(await download.path());
+            const prettyTitle = formatRussianTitle(item.title);
 
-                const upRes = await context.request.post(`${SITE_BASE_RAW}/admin_upload_pdf.php`, { data: { pass: ADMIN_PASS, data: buf.toString('base64'), name: `change_${Date.now()}` } });
-                const up = await upRes.json().catch(() => ({}));
+            const upRes = await context.request.post(`${SITE_BASE_RAW}/admin_upload_pdf.php`, { data: { pass: ADMIN_PASS, data: buf.toString('base64'), name: `change_${Date.now()}` } });
+            const up = await upRes.json().catch(() => ({}));
 
-                if (up.ok && up.url) {
-                    const addRes = await context.request.post(`${SITE_BASE_RAW}/admin_change_add.php`, {
-                        data: { pass: ADMIN_PASS, title: prettyTitle, url: up.url, source: item.url }
-                    });
-                    const add = await addRes.json().catch(() => ({}));
-                    if (add.added) {
-                        console.log(`✅ Добавлено: ${prettyTitle}`);
-                        lastAddedPrettyTitle = prettyTitle;
-                        addedCount++;
-                    }
+            if (up.ok && up.url) {
+                const addRes = await context.request.post(`${SITE_BASE_RAW}/admin_change_add.php`, {
+                    data: { pass: ADMIN_PASS, title: prettyTitle, url: up.url, source: item.url }
+                });
+                const add = await addRes.json().catch(() => ({}));
+                if (add.added) {
+                    console.log(`✅ Добавлено: ${prettyTitle}`);
+                    addedAnything = true;
+                    lastTitle = prettyTitle;
                 }
-            } catch (e) { console.log('Ошибка при добавлении', e.message); }
+            }
             await item.page.close();
         }
 
-        // 4. Оповещение: только одно, о самой последней дате
-        if (lastAddedPrettyTitle) {
+        if (addedAnything) {
+            console.log('Отправка уведомления в Telegram...');
             await context.request.post(`${SITE_BASE_RAW}/admin_broadcast.php`, {
-                data: { pass: ADMIN_PASS, text: `🔔 Новое изменение!\n\n${lastAddedPrettyTitle}` }
+                data: { pass: ADMIN_PASS, text: `🔔 Новое изменение!\n\n${lastTitle}` }
             });
         }
 
-    } catch (err) { console.error('Ошибка главной:', err.message); }
+    } catch (err) { console.error('Ошибка:', err.message); }
 
-    // 5. ЖЕСТКАЯ ОЧИСТКА САЙТА (по календарному весу)
+    // Очистка сайта (оставляем 3)
     try {
         const listRes = await context.request.get(`${SITE_BASE_RAW}/admin_change_list.php`, { params: { pass: ADMIN_PASS } });
         const data = await listRes.json();
         if (data.items && data.items.length > MAX_KEEP) {
-            // Сортируем всё что на сайте по весу даты
-            const itemsWithWeight = data.items.map(it => ({ ...it, weight: getDateWeight(it.title) }));
-            itemsWithWeight.sort((a, b) => b.weight - a.weight); // Новые (большой вес) в начале
-
-            const toDelete = itemsWithWeight.slice(MAX_KEEP);
-            for (const it of toDelete) {
+            const itemsWithWeight = data.items.map(it => ({ ...it, weight: parseNewsDate(it.title) }));
+            itemsWithWeight.sort((a, b) => b.weight - a.weight);
+            for (const it of itemsWithWeight.slice(MAX_KEEP)) {
                 await context.request.post(`${SITE_BASE_RAW}/admin_change_delete.php`, { data: { pass: ADMIN_PASS, id: it.id } });
-                console.log(`🗑 Удалено старое расписание: ${it.title}`);
             }
         }
     } catch (e) {}
 
+    // Удаление из ТГ старых кнопок
     await context.request.get(`${SITE_BASE_RAW}/admin_auto_cleanup.php`, { params: { pass: ADMIN_PASS } }).catch(() => {});
     await browser.close();
 }
