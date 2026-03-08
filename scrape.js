@@ -39,12 +39,20 @@ async function main() {
     const page = await context.newPage();
 
     try {
-        console.log('Загрузка портала...');
+       console.log('Загрузка портала...');
         await page.goto(DASHBOARD_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
-        
-        const links = await page.evaluate(() => 
-            Array.from(new Set(Array.from(document.querySelectorAll('a[href]'))
-            .map(a => a.href).filter(h => /\/news\/show\/\d+$/i.test(h))))
+        await page.waitForTimeout(5000); // Даем время на рендер JS
+
+        const pageTitle = await page.title();
+        const currentUrl = page.url();
+        console.log(`Заголовок страницы: "${pageTitle}"`);
+        console.log(`Текущий URL: ${currentUrl}`);
+
+        if (pageTitle.includes('вход') || pageTitle.includes('Авторизация') || currentUrl.includes('esia')) {
+            console.error('❌ ОШИБКА: Сессия state.json не сработала! Мы на странице логина.');
+            await browser.close();
+            return;
+        }
         );
         
         console.log(`Найдено ссылок: ${links.length}`);
