@@ -1,7 +1,7 @@
 import { chromium } from 'playwright'
 import fs from 'fs'
 
-console.log('--- ЗАПУСК СКРИПТА (ВЕРСИЯ: СКРИНШОТ ПДФ) ---');
+console.log('--- ЗАПУСК СКРИПТА (ВЕРСИЯ: ФОТО ИЗ ПДФ) ---');
 
 const DASHBOARD_URL = 'https://t15.ecp.egov66.ru/dashboard'
 const SITE_BASE_RAW = (process.env.SITE_BASE || '').trim().replace(/\/+$/, '')
@@ -33,12 +33,20 @@ function formatRussianTitle(title) {
 
 async function main() {
     const browser = await chromium.launch();
-    // Важно: устанавливаем большой размер окна для качественного скриншота
     const context = await browser.newContext({ 
         storageState: fs.existsSync('state.json') ? 'state.json' : undefined,
         acceptDownloads: true,
-        viewport: { width: 1200, height: 1600 }
+        viewport: { width: 1000, height: 1400 } // Размер листа А4 примерно
     });
+
+    // ХИТРОСТЬ: Перехватываем PDF и заставляем браузер его ПОКАЗАТЬ, а не скачать
+    await context.route('**/*', async route => {
+        const response = await route.fetch();
+        const headers = response.headers();
+        delete headers['content-disposition']; // Удаляем принудительное скачивание
+        await route.fulfill({ response, headers });
+    });
+
     const page = await context.newPage();
 
     try {
@@ -48,12 +56,11 @@ async function main() {
 
         const links = await page.evaluate(() => {
             const anchors = Array.from(document.querySelectorAll('a[href]'));
-            const list = anchors.map(a => a.href).filter(h => /\/news\/show\/\d+$/i.test(h));
-            return Array.from(new Set(list));
+            return Array.from(new Set(anchors.map(a => a.href).filter(h => /\/news\/show\/\d+$/i.test(h))));
         });
         
         let foundNews = [];
-        for (const url of links.slice(0, 10)) {
+        for (const url of links.slice(0, 8)) {
             const p = await context.newPage();
             try {
                 await p.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
@@ -77,18 +84,19 @@ async function main() {
         for (const item of foundNews) {
             const p = await context.newPage();
             try {
-                // ПЕРЕХОДИМ ПРЯМО НА ПДФ
-                console.log(`Открываю документ: ${item.url}`);
-                await p.goto(item.url, { waitUntil: 'networkidle' });
-                await p.waitForTimeout(3000); // Ждем рендера ПДФ внутри браузера
+                console.log(`Открываю документ для фото: ${item.url}`);
+                
+                // Переходим на PDF. Благодаря нашему route выше, он откроется как страница
+                await p.goto(item.url, { waitUntil: 'networkidle', timeout: 45000 });
+                await p.waitForTimeout(4000); // Даем время рендеру PDF
 
                 const prettyTitle = formatRussianTitle(item.title);
                 const fileKey = `ch_${Date.now()}`;
 
-                // Делаем скриншот ТОЛЬКО содержимого (без кнопок сайта)
+                // Делаем скриншот центральной части, где само расписание
                 const screenshotBuf = await p.screenshot({ type: 'png', fullPage: false });
 
-                // Скачиваем сам файл для базы
+                // Скачиваем сам PDF для архива
                 const pdfResp = await context.request.get(item.url);
                 const pdfBuf = await pdfResp.body();
 
@@ -97,7 +105,7 @@ async function main() {
                     data: { pass: ADMIN_PASS, data: pdfBuf.toString('base64'), name: fileKey, ext: 'pdf' }
                 });
 
-                // 2. Грузим Скриншот
+                // 2. Грузим Фото (PNG)
                 const imgRes = await context.request.post(`${SITE_BASE_RAW}/admin_upload_pdf.php`, {
                     data: { pass: ADMIN_PASS, data: screenshotBuf.toString('base64'), name: fileKey, ext: 'png' }
                 });
@@ -109,12 +117,12 @@ async function main() {
                     });
                     const add = await addRes.json().catch(() => ({}));
                     if (add.added) {
-                        console.log(`✅ ДОБАВЛЕНО: ${prettyTitle}`);
+                        console.log(`✅ ДОБАВЛЕНО С ФОТО: ${prettyTitle}`);
                         lastPrettyTitle = prettyTitle;
                         lastImgUrl = imgUp.url;
                     }
                 }
-            } catch (e) { console.log('Ошибка при создании скриншота ПДФ'); }
+            } catch (e) { console.log(`Ошибка на этапе создания фото: ${e.message}`); }
             await p.close();
         }
 
@@ -123,9 +131,9 @@ async function main() {
                 data: { pass: ADMIN_PASS, text: `🔔 Новое изменение!\n\n${lastPrettyTitle}`, img_url: lastImgUrl }
             });
         }
-    } catch (err) { console.error('Критическая ошибка:', err.message); }
+    } catch (err) { console.error('Ошибка:', err.message); }
 
-    // Очистка (оставляем 3)
+    // Очистка сайта
     try {
         const listRes = await context.request.get(`${SITE_BASE_RAW}/admin_change_list.php`, { params: { pass: ADMIN_PASS } });
         const data = await listRes.json();
@@ -138,6 +146,7 @@ async function main() {
     } catch (e) {}
 
     await browser.close();
+    console.log('--- РАБОТА ЗАВЕРШЕНА ---');
 }
 
-main();
+main().catch(e => { console.error(e); process.exit(1); });
