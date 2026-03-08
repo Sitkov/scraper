@@ -1,7 +1,7 @@
 import { chromium } from 'playwright'
 import fs from 'fs'
 
-console.log('--- ЗАПУСК СКРИПТА (FINAL VERSION) ---');
+console.log('--- ЗАПУСК СКРИПТА (ВЕРСИЯ: LONG IMAGE PDF) ---');
 
 const DASHBOARD_URL = 'https://t15.ecp.egov66.ru/dashboard'
 const SITE_BASE_RAW = (process.env.SITE_BASE || '').trim().replace(/\/+$/, '')
@@ -33,20 +33,19 @@ function formatRussianTitle(title) {
 
 async function main() {
     const browser = await chromium.launch();
-    const context = await browser.newContext({ 
-        storageState: fs.existsSync('state.json') ? 'state.json' : undefined,
-        acceptDownloads: true,
-        viewport: { width: 1000, height: 1300 }
-    });
+    const context = await browser.newContext({ acceptDownloads: true });
     const page = await context.newPage();
 
     try {
         console.log('Загрузка портала...');
         await page.goto(DASHBOARD_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
-        const links = await page.evaluate(() => Array.from(new Set(Array.from(document.querySelectorAll('a[href]')).map(a => a.href).filter(h => /\/news\/show\/\d+$/i.test(h)))));
+        const links = await page.evaluate(() => {
+            const anchors = Array.from(document.querySelectorAll('a[href]'));
+            return Array.from(new Set(anchors.map(a => a.href).filter(h => /\/news\/show\/\d+$/i.test(h))));
+        });
         
         let foundNews = [];
-        for (const url of links.slice(0, 10)) {
+        for (const url of links.slice(0, 8)) {
             const p = await context.newPage();
             try {
                 await p.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
@@ -61,66 +60,84 @@ async function main() {
             await p.close();
         }
 
-        // Сортируем от старых к новым
         foundNews.sort((a, b) => parseNewsDate(a.title) - parseNewsDate(b.title));
 
         let lastPrettyTitle = null;
+        let lastImgUrl = null;
 
         for (const item of foundNews) {
             try {
+                const prettyTitle = formatRussianTitle(item.title);
+                console.log(`Обработка: ${prettyTitle}`);
+
                 const pdfResp = await context.request.get(item.url);
                 const pdfBuf = await pdfResp.body();
                 const b64Pdf = pdfBuf.toString('base64');
 
-                // Создаем скриншоты каждой страницы (нарезаем по 1200px высотой)
+                // РЕНДЕРИНГ ЧЕРЕЗ PDF.JS (БЕЗ ПЛАГИНОВ)
                 const p = await context.newPage();
-                await p.setViewportSize({ width: 1000, height: 1300 });
-                await p.setContent(`<html><body style="margin:0;padding:0;overflow:hidden"><embed src="data:application/pdf;base64,${b64Pdf}" type="application/pdf" width="100%" height="100%"></body></html>`);
-                await p.waitForTimeout(5000);
+                await p.setViewportSize({ width: 1000, height: 1000 });
+                
+                await p.setContent(`
+                    <html>
+                    <head>
+                        <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+                        <style>body{margin:0;background:#fff} canvas{display:block;margin:0 auto;border-bottom:2px solid #ccc}</style>
+                    </head>
+                    <body><div id="viewer"></div>
+                    <script>
+                        const pdfData = atob("${b64Pdf}");
+                        pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+                        
+                        pdfjsLib.getDocument({data: pdfData}).promise.then(async (pdf) => {
+                            const viewer = document.getElementById('viewer');
+                            for(let i=1; i<=pdf.numPages; i++) {
+                                const page = await pdf.getPage(i);
+                                const viewport = page.getViewport({scale: 2.0});
+                                const canvas = document.createElement('canvas');
+                                canvas.width = viewport.width; canvas.height = viewport.height;
+                                viewer.appendChild(canvas);
+                                await page.render({canvasContext: canvas.getContext('2d'), viewport}).promise;
+                            }
+                            document.body.classList.add('ready');
+                        });
+                    </script>
+                    </body></html>
+                `);
 
-                const fullHeight = await p.evaluate(() => document.body.scrollHeight);
-                const pageHeight = 1200;
-                const pageCount = Math.ceil(fullHeight / pageHeight);
-                const imageUrls = [];
-
-                for (let i = 0; i < pageCount; i++) {
-                    const screenshotBuf = await p.screenshot({ type: 'png', clip: { x:0, y: i*pageHeight, width: 1000, height: Math.min(pageHeight, fullHeight - i*pageHeight) }});
-                    const imgRes = await context.request.post(`${SITE_BASE_RAW}/admin_upload_pdf.php`, {
-                        data: { pass: ADMIN_PASS, data: screenshotBuf.toString('base64'), name: `img_${Date.now()}_p${i}`, ext: 'png' }
-                    });
-                    const up = await imgRes.json();
-                    if (up.ok) imageUrls.push(up.url);
-                }
+                await p.waitForSelector('.ready', { timeout: 30000 });
+                const screenshotBuf = await p.screenshot({ type: 'png', fullPage: true });
                 await p.close();
 
-                const prettyTitle = formatRussianTitle(item.title);
                 const fileKey = `ch_${Date.now()}`;
-
-                // Грузим сам PDF
-                const upRes = await context.request.post(`${SITE_BASE_RAW}/admin_upload_pdf.php`, {
+                await context.request.post(`${SITE_BASE_RAW}/admin_upload_pdf.php`, {
                     data: { pass: ADMIN_PASS, data: b64Pdf, name: fileKey, ext: 'pdf' }
                 });
-                const up = await upRes.json();
+                const imgRes = await context.request.post(`${SITE_BASE_RAW}/admin_upload_pdf.php`, {
+                    data: { pass: ADMIN_PASS, data: screenshotBuf.toString('base64'), name: fileKey, ext: 'png' }
+                });
+                const imgUp = await imgRes.json();
 
-                if (up.ok) {
+                if (imgUp.ok) {
                     const addRes = await context.request.post(`${SITE_BASE_RAW}/admin_change_add.php`, {
-                        data: { pass: ADMIN_PASS, title: prettyTitle, url: up.url, source: item.newsUrl, images: imageUrls }
+                        data: { pass: ADMIN_PASS, title: prettyTitle, url: '/api/files/' + fileKey + '.pdf', source: item.newsUrl, img_url: imgUp.url }
                     });
                     const add = await addRes.json();
                     if (add.added) {
                         console.log(`✅ ДОБАВЛЕНО: ${prettyTitle}`);
                         lastPrettyTitle = prettyTitle;
+                        lastImgUrl = imgUp.url;
                     }
                 }
-            } catch (e) { console.log(`Ошибка обработки: ${e.message}`); }
+            } catch (e) { console.log(`Ошибка: ${e.message}`); }
         }
 
         if (lastPrettyTitle) {
             await context.request.post(`${SITE_BASE_RAW}/admin_broadcast.php`, {
-                data: { pass: ADMIN_PASS, text: `🔔 Новое изменение!\n\n${lastPrettyTitle}` }
+                data: { pass: ADMIN_PASS, text: `🔔 Новое изменение!\n\n${lastPrettyTitle}`, img_url: lastImgUrl }
             });
         }
-    } catch (err) { console.error(err.message); }
+    } catch (err) { console.error('Критическая ошибка:', err.message); }
 
     // Очистка сайта
     try {
@@ -133,8 +150,6 @@ async function main() {
             }
         }
     } catch (e) {}
-
-    await context.request.get(`${SITE_BASE_RAW}/admin_auto_cleanup.php`, { params: { pass: ADMIN_PASS } }).catch(() => {});
     await browser.close();
 }
 main();
