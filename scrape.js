@@ -34,8 +34,8 @@ async function main() {
     const hasState = fs.existsSync('state.json');
     const context = await browser.newContext({ 
         storageState: hasState ? 'state.json' : undefined,
-        deviceScaleFactor: 3, // Максимальная четкость
-        viewport: { width: 1000, height: 1200 }
+        deviceScaleFactor: 3, 
+        viewport: { width: 1000, height: 1000 }
     });
     
     const page = await context.newPage();
@@ -75,7 +75,7 @@ async function main() {
                 const b64Pdf = pdfBuf.toString('base64');
 
                 const p = await context.newPage();
-                await p.setViewportSize({ width: 900, height: 800 });
+                await p.setViewportSize({ width: 900, height: 700 });
                 await p.setContent(`
                     <html><head><script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
                     <style>body{margin:0;background:#fff} canvas{display:block;margin:0 auto;}</style></head>
@@ -96,7 +96,8 @@ async function main() {
                 `);
 
                 await p.waitForSelector('.ready', { timeout: 30000 });
-                const screenshotBuf = await p.screenshot({ type: 'png', fullPage: true });
+                // Скриншот в качественном JPEG (легче для Telegram, чем PNG)
+                const screenshotBuf = await p.screenshot({ type: 'jpeg', quality: 90, fullPage: true });
                 await p.close();
 
                 const fileKey = `ch_${Date.now()}`;
@@ -104,7 +105,7 @@ async function main() {
                     data: { pass: ADMIN_PASS, data: b64Pdf, name: fileKey, ext: 'pdf' }
                 });
                 const imgRes = await context.request.post(`${SITE_BASE_RAW}/admin_upload_pdf.php`, {
-                    data: { pass: ADMIN_PASS, data: screenshotBuf.toString('base64'), name: fileKey, ext: 'png' }
+                    data: { pass: ADMIN_PASS, data: screenshotBuf.toString('base64'), name: fileKey, ext: 'jpg' }
                 });
                 const imgUp = await imgRes.json().catch(()=>({}));
 
