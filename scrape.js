@@ -1,8 +1,7 @@
 import { chromium } from 'playwright'
 import fs from 'fs'
 
-// Это сообщение ОБЯЗАННО появиться в логах, если файл читается
-console.log('--- СКРИПТ ЗАПУЩЕН ---');
+console.log('--- ИНИЦИАЛИЗАЦИЯ СКРИПТА ---');
 
 const DASHBOARD_URL = 'https://t15.ecp.egov66.ru/dashboard'
 const SITE_BASE_RAW = (process.env.SITE_BASE || '').trim().replace(/\/+$/, '')
@@ -35,30 +34,38 @@ function formatRussianTitle(title) {
 async function main() {
     console.log('Запуск браузера...');
     const browser = await chromium.launch();
-    const context = await browser.newContext({ acceptDownloads: true });
+    const context = await browser.newContext({ 
+        storageState: fs.existsSync('state.json') ? 'state.json' : undefined,
+        acceptDownloads: true 
+    });
     const page = await context.newPage();
 
     try {
-       console.log('Загрузка портала...');
+        console.log('Загрузка портала...');
         await page.goto(DASHBOARD_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
-        await page.waitForTimeout(5000); // Даем время на рендер JS
+        await page.waitForTimeout(5000); 
 
+        // ПРОВЕРКА АВТОРИЗАЦИИ
         const pageTitle = await page.title();
-        const currentUrl = page.url();
         console.log(`Заголовок страницы: "${pageTitle}"`);
-        console.log(`Текущий URL: ${currentUrl}`);
+        if (pageTitle.includes('ход') || pageTitle.includes('вторизация')) {
+            console.error('❌ ОШИБКА: state.json не сработал. Нужно обновить куки ЕСИА!');
+        }
 
-        if (pageTitle.includes('вход') || pageTitle.includes('Авторизация') || currentUrl.includes('esia')) {
-            console.error('❌ ОШИБКА: Сессия state.json не сработала! Мы на странице логина.');
+        const links = await page.evaluate(() => {
+            const anchors = Array.from(document.querySelectorAll('a[href]'));
+            const list = anchors.map(a => a.href).filter(h => /\/news\/show\/\d+$/i.test(h));
+            return Array.from(new Set(list));
+        });
+        
+        console.log(`Найдено ссылок на новости: ${links.length}`);
+        if (links.length === 0) {
+            console.log('Новостей нет. Возможно, сессия истекла или на странице пусто.');
             await browser.close();
             return;
         }
-        );
-        
-        console.log(`Найдено ссылок: ${links.length}`);
-        let foundNews = [];
 
-        // Шаг 1: Сбор заголовков
+        let foundNews = [];
         for (const url of links.slice(0, 10)) {
             const p = await context.newPage();
             try {
@@ -70,17 +77,15 @@ async function main() {
                         foundNews.push({ title, url, pdfSelector });
                     }
                 }
-            } catch (e) { console.log('Ошибка при чтении вкладки'); }
+            } catch (e) { console.log(`Ошибка при чтении новости ${url}`); }
             await p.close();
         }
 
-        // Шаг 2: Сортировка (старые в начале)
         foundNews.sort((a, b) => parseNewsDate(a.title) - parseNewsDate(b.title));
 
         let lastPrettyTitle = null;
         let lastImgUrl = null;
 
-        // Шаг 3: Обработка и загрузка
         for (const item of foundNews) {
             const p = await context.newPage();
             try {
@@ -88,53 +93,45 @@ async function main() {
                 const prettyTitle = formatRussianTitle(item.title);
                 const fileKey = `ch_${Date.now()}`;
 
-                console.log(`Обработка: ${prettyTitle}`);
-
-                // Скачиваем PDF
                 const [download] = await Promise.all([
                     p.waitForEvent('download'),
                     p.click(item.pdfSelector)
                 ]);
                 const buf = fs.readFileSync(await download.path());
 
-                // Делаем скриншот
                 await p.setViewportSize({ width: 800, height: 1000 });
                 const screenshotBuf = await p.screenshot({ type: 'png' });
 
-                // Грузим PDF
                 const upRes = await context.request.post(`${SITE_BASE_RAW}/admin_upload_pdf.php`, {
                     data: { pass: ADMIN_PASS, data: buf.toString('base64'), name: fileKey, ext: 'pdf' }
                 });
-                const up = await upRes.json();
+                const up = await upRes.json().catch(() => ({}));
 
-                // Грузим Скриншот
                 const imgRes = await context.request.post(`${SITE_BASE_RAW}/admin_upload_pdf.php`, {
                     data: { pass: ADMIN_PASS, data: screenshotBuf.toString('base64'), name: fileKey, ext: 'png' }
                 });
-                const imgUp = await imgRes.json();
+                const imgUp = await imgRes.json().catch(() => ({}));
 
                 if (up.ok && up.url) {
                     const addRes = await context.request.post(`${SITE_BASE_RAW}/admin_change_add.php`, {
                         data: { pass: ADMIN_PASS, title: prettyTitle, url: up.url, source: item.url, img_url: imgUp.url || "" }
                     });
-                    const add = await addRes.json();
+                    const add = await addRes.json().catch(() => ({}));
                     if (add.added) {
-                        console.log(`✅ Добавлено: ${prettyTitle}`);
+                        console.log(`✅ ДОБАВЛЕНО: ${prettyTitle}`);
                         lastPrettyTitle = prettyTitle;
                         lastImgUrl = imgUp.url || "";
                     }
                 }
-            } catch (e) { console.log('Ошибка при скачивании/загрузке'); }
+            } catch (e) { console.log('Ошибка обработки файла'); }
             await p.close();
         }
 
-        // Оповещение один раз в конце
         if (lastPrettyTitle) {
             await context.request.post(`${SITE_BASE_RAW}/admin_broadcast.php`, {
                 data: { pass: ADMIN_PASS, text: `🔔 Новое изменение!\n\n${lastPrettyTitle}`, img_url: lastImgUrl }
             });
         }
-
     } catch (err) { console.error('Ошибка:', err.message); }
 
     // Очистка сайта
