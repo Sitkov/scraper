@@ -1,7 +1,7 @@
 import { chromium } from 'playwright'
 import fs from 'fs'
 
-console.log('--- ЗАПУСК СКРИПТА (ВЕРСИЯ: LONG IMAGE PDF) ---');
+console.log('--- ЗАПУСК СКРИПТА (FINAL LONG-IMAGE VERSION) ---');
 
 const DASHBOARD_URL = 'https://t15.ecp.egov66.ru/dashboard'
 const SITE_BASE_RAW = (process.env.SITE_BASE || '').trim().replace(/\/+$/, '')
@@ -45,7 +45,7 @@ async function main() {
         });
         
         let foundNews = [];
-        for (const url of links.slice(0, 8)) {
+        for (const url of links.slice(0, 10)) {
             const p = await context.newPage();
             try {
                 await p.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
@@ -53,7 +53,8 @@ async function main() {
                 if (title.toLowerCase().includes('изменени')) {
                     const pdfLink = await p.getAttribute('a[href*=".pdf"], a[href*="/download/"]', 'href');
                     if (pdfLink) {
-                        foundNews.push({ title, url: pdfLink.startsWith('http') ? pdfLink : new URL(pdfLink, DASHBOARD_URL).href, newsUrl: url });
+                        const fullPdfUrl = pdfLink.startsWith('http') ? pdfLink : new URL(pdfLink, DASHBOARD_URL).href;
+                        foundNews.push({ title, url: fullPdfUrl, newsUrl: url });
                     }
                 }
             } catch (e) {}
@@ -61,58 +62,49 @@ async function main() {
         }
 
         foundNews.sort((a, b) => parseNewsDate(a.title) - parseNewsDate(b.title));
-
         let lastPrettyTitle = null;
         let lastImgUrl = null;
 
         for (const item of foundNews) {
             try {
-                const prettyTitle = formatRussianTitle(item.title);
-                console.log(`Обработка: ${prettyTitle}`);
-
                 const pdfResp = await context.request.get(item.url);
                 const pdfBuf = await pdfResp.body();
                 const b64Pdf = pdfBuf.toString('base64');
 
-                // РЕНДЕРИНГ ЧЕРЕЗ PDF.JS (БЕЗ ПЛАГИНОВ)
+                // РЕНДЕРИНГ ЧЕРЕЗ PDF.JS ВНУТРИ БРАУЗЕРА (БЕЗ ПЛАГИНОВ)
                 const p = await context.newPage();
                 await p.setViewportSize({ width: 1000, height: 1000 });
-                
                 await p.setContent(`
-                    <html>
-                    <head>
+                    <html><head>
                         <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
                         <style>body{margin:0;background:#fff} canvas{display:block;margin:0 auto;border-bottom:2px solid #ccc}</style>
-                    </head>
-                    <body><div id="viewer"></div>
-                    <script>
-                        const pdfData = atob("${b64Pdf}");
+                    </head><body><div id="v"></div><script>
                         pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
-                        
-                        pdfjsLib.getDocument({data: pdfData}).promise.then(async (pdf) => {
-                            const viewer = document.getElementById('viewer');
+                        pdfjsLib.getDocument({data: atob("${b64Pdf}")}).promise.then(async (pdf) => {
+                            const v = document.getElementById('v');
                             for(let i=1; i<=pdf.numPages; i++) {
                                 const page = await pdf.getPage(i);
-                                const viewport = page.getViewport({scale: 2.0});
+                                const vp = page.getViewport({scale: 2.0});
                                 const canvas = document.createElement('canvas');
-                                canvas.width = viewport.width; canvas.height = viewport.height;
-                                viewer.appendChild(canvas);
-                                await page.render({canvasContext: canvas.getContext('2d'), viewport}).promise;
+                                canvas.width = vp.width; canvas.height = vp.height;
+                                v.appendChild(canvas);
+                                await page.render({canvasContext: canvas.getContext('2d'), viewport: vp}).promise;
                             }
                             document.body.classList.add('ready');
                         });
-                    </script>
-                    </body></html>
+                    </script></body></html>
                 `);
 
-                await p.waitForSelector('.ready', { timeout: 30000 });
+                await p.waitForSelector('.ready', { timeout: 40000 });
                 const screenshotBuf = await p.screenshot({ type: 'png', fullPage: true });
                 await p.close();
 
                 const fileKey = `ch_${Date.now()}`;
+                // Грузим PDF
                 await context.request.post(`${SITE_BASE_RAW}/admin_upload_pdf.php`, {
                     data: { pass: ADMIN_PASS, data: b64Pdf, name: fileKey, ext: 'pdf' }
                 });
+                // Грузим длинный скриншот
                 const imgRes = await context.request.post(`${SITE_BASE_RAW}/admin_upload_pdf.php`, {
                     data: { pass: ADMIN_PASS, data: screenshotBuf.toString('base64'), name: fileKey, ext: 'png' }
                 });
@@ -120,26 +112,26 @@ async function main() {
 
                 if (imgUp.ok) {
                     const addRes = await context.request.post(`${SITE_BASE_RAW}/admin_change_add.php`, {
-                        data: { pass: ADMIN_PASS, title: prettyTitle, url: '/api/files/' + fileKey + '.pdf', source: item.newsUrl, img_url: imgUp.url }
+                        data: { pass: ADMIN_PASS, title: formatRussianTitle(item.title), url: '/api/files/' + fileKey + '.pdf', source: item.newsUrl, img_url: imgUp.url }
                     });
                     const add = await addRes.json();
                     if (add.added) {
-                        console.log(`✅ ДОБАВЛЕНО: ${prettyTitle}`);
-                        lastPrettyTitle = prettyTitle;
+                        console.log(`✅ ДОБАВЛЕНО: ${item.title}`);
+                        lastPrettyTitle = formatRussianTitle(item.title);
                         lastImgUrl = imgUp.url;
                     }
                 }
-            } catch (e) { console.log(`Ошибка: ${e.message}`); }
+            } catch (e) { console.log(`Ошибка обработки: ${e.message}`); }
         }
 
         if (lastPrettyTitle) {
             await context.request.post(`${SITE_BASE_RAW}/admin_broadcast.php`, {
-                data: { pass: ADMIN_PASS, text: `🔔 Новое изменение!\n\n${lastPrettyTitle}`, img_url: lastImgUrl }
+                data: { pass: ADMIN_PASS, text: `🔔 Новое изменение!\n\n${lastPrettyTitle}` }
             });
         }
     } catch (err) { console.error('Критическая ошибка:', err.message); }
 
-    // Очистка сайта
+    // Очистка сайта (оставляем 3)
     try {
         const listRes = await context.request.get(`${SITE_BASE_RAW}/admin_change_list.php`, { params: { pass: ADMIN_PASS } });
         const data = await listRes.json();
