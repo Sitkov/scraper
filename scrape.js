@@ -22,32 +22,47 @@ function getCorrectTitle(rawTitle) {
 }
 
 async function main() {
+    console.log("🚀 Запуск скрипта...");
     const browser = await chromium.launch();
     const context = await browser.newContext({ deviceScaleFactor: 2 });
     const page = await context.newPage();
 
     try {
+        console.log(`🔗 Переход на ${DASHBOARD_URL}`);
         await page.goto(DASHBOARD_URL, { waitUntil: 'networkidle', timeout: 60000 });
+        
         const links = await page.evaluate(() => 
             Array.from(new Set(Array.from(document.querySelectorAll('a[href*="/news/show/"]')).map(a => a.href)))
         );
 
-        for (const url of links.slice(0, 1)) {
+        console.log(`🔎 Найдено новостей: ${links.length}`);
+
+        if (links.length === 0) {
+            console.log("❌ Ссылок на новости не найдено. Проверь селекторы.");
+        }
+
+        for (const url of links.slice(0, 2)) {
+            console.log(`\n📄 Проверяю новость: ${url}`);
             const p = await context.newPage();
             await p.goto(url, { waitUntil: 'networkidle' });
-            const rawTitle = (await p.innerText('h1, h2').catch(() => 'Изменения')).trim();
             
-            if (rawTitle.toLowerCase().includes('изменени')) {
-                const title = getCorrectTitle(rawTitle);
+            const rawTitle = (await p.innerText('h1, h2, .title').catch(() => 'Без заголовка')).trim();
+            console.log(`📝 Заголовок: "${rawTitle}"`);
+            
+            // Проверка на ключевое слово (убрал строгость)
+            if (rawTitle.toLowerCase().includes('изменен')) {
+                console.log("✅ Это новость про изменения. Ищу PDF...");
                 const pdfLink = await p.evaluate(() => document.querySelector('a[href*=".pdf"]')?.href);
 
                 if (pdfLink) {
+                    console.log(`📎 PDF найден: ${pdfLink}`);
                     const pdfResp = await context.request.get(pdfLink);
                     const pdfBuf = await pdfResp.body();
                     const b64Pdf = pdfBuf.toString('base64');
                     const fileKey = `ch_${Date.now()}`;
+                    const title = getCorrectTitle(rawTitle);
 
-                    // Рендерим PDF в картинку для сайта/инлайна
+                    console.log("🎨 Рендерю скриншот PDF...");
                     const renderPage = await context.newPage();
                     await renderPage.setViewportSize({ width: 1000, height: 1200 });
                     await renderPage.setContent(`
@@ -70,24 +85,33 @@ async function main() {
                     const imgBuf = await renderPage.screenshot({ type: 'jpeg', quality: 85, fullPage: true });
                     await renderPage.close();
 
-                    // Загружаем файлы
+                    console.log("📡 Отправляю данные на сервер...");
                     await context.request.post(`${SITE_BASE_RAW}/admin_upload_pdf.php`, { data: { pass: ADMIN_PASS, data: b64Pdf, name: fileKey, ext: 'pdf' } });
                     const imgRes = await context.request.post(`${SITE_BASE_RAW}/admin_upload_pdf.php`, { data: { pass: ADMIN_PASS, data: imgBuf.toString('base64'), name: fileKey, ext: 'jpg' } });
-                    const imgData = await imgRes.json();
+                    const imgData = await imgRes.json().catch(() => ({}));
 
-                    // Сохраняем в базу
-                    await context.request.post(`${SITE_BASE_RAW}/admin_change_add.php`, {
+                    const addRes = await context.request.post(`${SITE_BASE_RAW}/admin_change_add.php`, {
                         data: { pass: ADMIN_PASS, title: title, url: `/api/files/${fileKey}.pdf`, source: url, img_url: imgData.url }
                     });
+                    console.log("📥 Результат добавления:", await addRes.text());
 
-                    // Рассылка - ТОЛЬКО ТЕКСТ
-                    await context.request.post(`${SITE_BASE_RAW}/admin_broadcast.php`, {
-                        data: { pass: ADMIN_PASS, text: `🔔 <b>${title}</b>\n\nИзменения уже на сайте!` }
+                    const broadRes = await context.request.post(`${SITE_BASE_RAW}/admin_broadcast.php`, {
+                        data: { pass: ADMIN_PASS, text: `🔔 <b>${title}</b>` }
                     });
+                    console.log("📢 Результат рассылки:", await broadRes.text());
+                } else {
+                    console.log("⚠️ PDF файл в новости не найден.");
                 }
+            } else {
+                console.log("⏭️ Пропускаю (не относится к изменениям).");
             }
             await p.close();
         }
-    } finally { await browser.close(); }
+    } catch (err) {
+        console.error("⛔ Критическая ошибка скрипта:", err);
+    } finally {
+        await browser.close();
+        console.log("🏁 Скрипт завершен.");
+    }
 }
 main();
