@@ -1,7 +1,7 @@
 import { chromium } from 'playwright'
 import fs from 'fs'
 
-console.log('--- ЗАПУСК СКРИПТА (MAX QUALITY & CLEAN CAPTION) ---');
+console.log('--- ЗАПУСК СКРИПТА (MAX QUALITY & FIXED BROADCAST) ---');
 
 const DASHBOARD_URL = 'https://t15.ecp.egov66.ru/dashboard'
 const SITE_BASE_RAW = (process.env.SITE_BASE || '').trim().replace(/\/+$/, '')
@@ -36,7 +36,7 @@ async function main() {
     const context = await browser.newContext({ 
         storageState: fs.existsSync('state.json') ? 'state.json' : undefined,
         acceptDownloads: true,
-        deviceScaleFactor: 2, // Физическое увеличение плотности пикселей
+        deviceScaleFactor: 2,
         viewport: { width: 1200, height: 1600 }
     });
     const page = await context.newPage();
@@ -67,6 +67,7 @@ async function main() {
         }
 
         foundNews.sort((a, b) => parseNewsDate(a.title) - parseNewsDate(b.title));
+
         let lastPrettyTitle = null;
         let lastImgUrl = null;
 
@@ -91,7 +92,7 @@ async function main() {
                             const v = document.getElementById('v');
                             for(let i=1; i<=pdf.numPages; i++) {
                                 const page = await pdf.getPage(i);
-                                const vp = page.getViewport({scale: 3.0}); // ВЫСОКОЕ КАЧЕСТВО
+                                const vp = page.getViewport({scale: 3.0}); 
                                 const canvas = document.createElement('canvas');
                                 canvas.width = vp.width; canvas.height = vp.height;
                                 v.appendChild(canvas);
@@ -113,30 +114,36 @@ async function main() {
                 const imgRes = await context.request.post(`${SITE_BASE_RAW}/admin_upload_pdf.php`, {
                     data: { pass: ADMIN_PASS, data: screenshotBuf.toString('base64'), name: fileKey, ext: 'png' }
                 });
-                const imgUp = await imgRes.json();
+                const imgUp = await imgRes.json().catch(()=>({}));
 
                 if (imgUp.ok) {
                     const addRes = await context.request.post(`${SITE_BASE_RAW}/admin_change_add.php`, {
                         data: { pass: ADMIN_PASS, title: `📅 ${prettyTitle}`, url: '/api/files/' + fileKey + '.pdf', source: item.newsUrl, img_url: imgUp.url }
                     });
-                    const add = await addRes.json();
+                    const add = await addRes.json().catch(()=>({}));
                     if (add.added) {
                         console.log(`✅ ДОБАВЛЕНО: ${prettyTitle}`);
                         lastPrettyTitle = `📅 ${prettyTitle}`;
-                        lastImgUrl = imgUp.url;
+                        lastImgUrl = imgUp.url; // Сохраняем ссылку для рассылки
                     }
                 }
             } catch (e) { console.log(`Ошибка: ${e.message}`); }
         }
 
-        if (lastPrettyTitle && lastImgUrl) {
-            await context.request.post(`${SITE_BASE_RAW}/admin_broadcast.php`, {
-                data: { pass: ADMIN_PASS, text: `🔔 Новое изменение!\n\n${lastPrettyTitle}`, img_url: lastImgUrl }
+        if (lastPrettyTitle) {
+            console.log('Вызываю рассылку...');
+            const broadcastRes = await context.request.post(`${SITE_BASE_RAW}/admin_broadcast.php`, {
+                data: { 
+                    pass: ADMIN_PASS, 
+                    text: `🔔 Новое изменение!\n\n${lastPrettyTitle}`, 
+                    img_url: lastImgUrl // ПЕРЕДАЕМ КАРТИНКУ В БОТА
+                }
             });
+            console.log('Статус рассылки:', broadcastRes.status());
         }
     } catch (err) { console.error('Ошибка:', err.message); }
 
-    // Очистка сайта (оставляем 3)
+    // Очистка сайта
     try {
         const listRes = await context.request.get(`${SITE_BASE_RAW}/admin_change_list.php`, { params: { pass: ADMIN_PASS } });
         const data = await listRes.json();
@@ -152,5 +159,4 @@ async function main() {
     await browser.close();
     console.log('--- РАБОТА ЗАВЕРШЕНА ---');
 }
-
 main();
