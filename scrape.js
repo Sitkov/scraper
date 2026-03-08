@@ -152,12 +152,13 @@ async function main() {
             } catch (e) { console.log(`Ошибка страницы файла: ${e.message}`); }
         }
 
-        // РАССЫЛКА (Один раз в конце)
         if (lastPrettyTitle && lastImgUrl) {
-            console.log('Отправка уведомления в Telegram...');
-            await context.request.post(`${SITE_BASE_RAW}/admin_broadcast.php`, {
+            console.log(`--- ПОПЫТКА РАССЫЛКИ: ${lastPrettyTitle} ---`);
+            const bRes = await context.request.post(`${SITE_BASE_RAW}/admin_broadcast.php`, {
                 data: { pass: ADMIN_PASS, text: lastPrettyTitle, img_url: lastImgUrl }
-            }).catch(() => {});
+            });
+            const bData = await bRes.json().catch(() => ({}));
+            console.log(`Результат: ${bRes.status()}, Отправлено: ${bData.sent || 0} сообщений`);
         }
 
     } catch (err) { console.error('Ошибка главной:', err.message); }
