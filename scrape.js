@@ -18,7 +18,6 @@ function parseNewsDate(title) {
     return (m * 100) + d;
 }
 
-// Убран лишний смайлик, оставлен только один 📅
 function formatRussianTitle(title) {
     let match = title.match(/(\d{1,2})\s+([а-яё]+)/i) || title.match(/(\d{1,2})\.(\d{1,2})/);
     if (match) {
@@ -35,7 +34,7 @@ async function main() {
     const hasState = fs.existsSync('state.json');
     const context = await browser.newContext({ 
         storageState: hasState ? 'state.json' : undefined,
-        deviceScaleFactor: 3, // УВЕЛИЧЕНО ДЛЯ ЧЕТКОСТИ (High DPI)
+        deviceScaleFactor: 3, // Максимальная четкость
         viewport: { width: 1000, height: 1200 }
     });
     
@@ -43,7 +42,6 @@ async function main() {
 
     try {
         await page.goto(DASHBOARD_URL, { waitUntil: 'networkidle', timeout: 60000 });
-        await page.waitForSelector('a[href*="/news/show/"]', { timeout: 15000 }).catch(() => {});
         const links = await page.evaluate(() => {
             const anchors = Array.from(document.querySelectorAll('a[href*="/news/show/"]'));
             return Array.from(new Set(anchors.map(a => a.href)));
@@ -67,8 +65,7 @@ async function main() {
 
         foundNews.sort((a, b) => parseNewsDate(a.title) - parseNewsDate(b.title));
 
-        let lastPrettyTitle = null;
-        let lastImgUrl = null;
+        let lastData = null;
 
         for (const item of foundNews) {
             try {
@@ -78,18 +75,17 @@ async function main() {
                 const b64Pdf = pdfBuf.toString('base64');
 
                 const p = await context.newPage();
-                await p.setViewportSize({ width: 900, height: 1000 });
+                await p.setViewportSize({ width: 900, height: 800 });
                 await p.setContent(`
-                    <html><head>
-                        <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
-                        <style>body{margin:0;background:#fff} canvas{display:block;margin:0 auto;}</style>
-                    </head><body><div id="v"></div><script>
+                    <html><head><script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+                    <style>body{margin:0;background:#fff} canvas{display:block;margin:0 auto;}</style></head>
+                    <body><div id="v"></div><script>
                         const pdfData = atob("${b64Pdf}");
                         pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
                         pdfjsLib.getDocument({data: pdfData}).promise.then(async (pdf) => {
                             const v = document.getElementById('v');
                             const page = await pdf.getPage(1);
-                            const vp = page.getViewport({scale: 3.0}); // Высокое разрешение рендеринга
+                            const vp = page.getViewport({scale: 3.5});
                             const canvas = document.createElement('canvas');
                             canvas.width = vp.width; canvas.height = vp.height;
                             v.appendChild(canvas);
@@ -100,7 +96,6 @@ async function main() {
                 `);
 
                 await p.waitForSelector('.ready', { timeout: 30000 });
-                // Используем PNG для максимального качества текста
                 const screenshotBuf = await p.screenshot({ type: 'png', fullPage: true });
                 await p.close();
 
@@ -114,26 +109,21 @@ async function main() {
                 const imgUp = await imgRes.json().catch(()=>({}));
 
                 if (imgUp.ok) {
-                    const addRes = await context.request.post(`${SITE_BASE_RAW}/admin_change_add.php`, {
+                    await context.request.post(`${SITE_BASE_RAW}/admin_change_add.php`, {
                         data: { pass: ADMIN_PASS, title: prettyTitle, url: '/api/files/' + fileKey + '.pdf', source: item.newsUrl, img_url: imgUp.url }
                     });
-                    const add = await addRes.json().catch(()=>({}));
-                    if (add.added) {
-                        lastPrettyTitle = prettyTitle;
-                        lastImgUrl = imgUp.url;
-                    }
+                    lastData = { title: prettyTitle, img: imgUp.url };
                 }
             } catch (e) { console.log(e.message); }
         }
 
-        if (lastPrettyTitle && lastImgUrl) {
+        if (lastData) {
             await context.request.post(`${SITE_BASE_RAW}/admin_broadcast.php`, {
-                data: { pass: ADMIN_PASS, text: `🔔 <b>Новое изменение!</b>\n\n${lastPrettyTitle}`, img_url: lastImgUrl }
+                data: { pass: ADMIN_PASS, text: `🔔 <b>Новое изменение!</b>\n\n${lastData.title}`, img_url: lastData.img }
             });
         }
     } finally {
         await browser.close();
-        console.log('--- ЗАВЕРШЕНО ---');
     }
 }
 main();
