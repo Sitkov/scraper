@@ -1,14 +1,14 @@
 import { chromium } from 'playwright'
 import fs from 'fs'
 
-console.log('--- ЗАПУСК СКРИПТА (ВЕРСИЯ С ЛОГОМ РАССЫЛКИ) ---');
+console.log('--- ЗАПУСК СКРИПТА (STABLE VERSION) ---');
 
 const DASHBOARD_URL = 'https://t15.ecp.egov66.ru/dashboard'
 const SITE_BASE_RAW = (process.env.SITE_BASE || '').trim().replace(/\/+$/, '')
 const ADMIN_PASS    = (process.env.ADMIN_PASS || '').trim()
 const MAX_KEEP      = 3;
 
-const monthsMap = {'янв':1, 'фев':2, 'мар':3, 'апр':4, 'мая':5, 'июн':6, 'июл':7, 'авг':8, 'сен':9, 'окт':10, 'ноя':11, 'дек':12};
+const monthsMap = {'янв':1, 'фев':2, 'мар':3, 'апр':4, 'мая':5, 'июн':6, 'июл':7, 'вг':8, 'сен':9, 'окт':10, 'ноя':11, 'дек':12};
 const monthsArr = ['января', 'февраля', 'марта', 'апреля', 'мая', 'июня', 'июля', 'августа', 'сентября', 'октября', 'ноября', 'декабря'];
 const daysArr = ['Воскресенье', 'Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота'];
 
@@ -34,10 +34,9 @@ function formatRussianTitle(title) {
 async function main() {
     const browser = await chromium.launch();
     const context = await browser.newContext({ 
-        storageState: fs.existsSync('state.json') ? 'state.json' : undefined,
         acceptDownloads: true,
-        deviceScaleFactor: 2,
-        viewport: { width: 1200, height: 1600 }
+        deviceScaleFactor: 2, // Плотность пикселей (дает четкость)
+        viewport: { width: 1000, height: 1200 }
     });
     const page = await context.newPage();
 
@@ -70,7 +69,6 @@ async function main() {
         }
 
         foundNews.sort((a, b) => parseNewsDate(a.title) - parseNewsDate(b.title));
-        
         let lastPrettyTitle = null;
         let lastImgUrl = null;
 
@@ -85,28 +83,30 @@ async function main() {
 
                 const p = await context.newPage();
                 await p.setViewportSize({ width: 1000, height: 1000 });
+                // Используем scale 2.0 для стабильности (deviceScaleFactor 2 сделает его 4.0 по факту)
                 await p.setContent(`
                     <html><head>
                         <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
                         <style>body{margin:0;background:#fff} canvas{display:block;margin:0 auto;}</style>
                     </head><body><div id="v"></div><script>
+                        const pdfData = atob("${b64Pdf}");
                         pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
-                        pdfjsLib.getDocument({data: atob("${b64Pdf}")}).promise.then(async (pdf) => {
+                        pdfjsLib.getDocument({data: pdfData}).promise.then(async (pdf) => {
                             const v = document.getElementById('v');
                             for(let i=1; i<=pdf.numPages; i++) {
                                 const page = await pdf.getPage(i);
-                                const vp = page.getViewport({scale: 3.0}); 
+                                const vp = page.getViewport({scale: 2.0}); 
                                 const canvas = document.createElement('canvas');
-                                canvas.width = viewport.width; canvas.height = viewport.height;
+                                canvas.width = vp.width; canvas.height = vp.height;
                                 v.appendChild(canvas);
                                 await page.render({canvasContext: canvas.getContext('2d'), viewport: vp}).promise;
                             }
                             document.body.classList.add('ready');
-                        });
+                        }).catch(e => { document.body.classList.add('error'); });
                     </script></body></html>
                 `);
 
-                await p.waitForSelector('.ready', { timeout: 40000 });
+                await p.waitForSelector('.ready', { timeout: 60000 });
                 const screenshotBuf = await p.screenshot({ type: 'png', fullPage: true });
                 await p.close();
 
@@ -121,12 +121,12 @@ async function main() {
 
                 if (imgUp.ok) {
                     const addRes = await context.request.post(`${SITE_BASE_RAW}/admin_change_add.php`, {
-                        data: { pass: ADMIN_PASS, title: `📅 ${prettyTitle}`, url: '/api/files/' + fileKey + '.pdf', source: item.newsUrl, img_url: imgUp.url }
+                        data: { pass: ADMIN_PASS, title: prettyTitle, url: '/api/files/' + fileKey + '.pdf', source: item.newsUrl, img_url: imgUp.url }
                     });
                     const add = await addRes.json().catch(()=>({}));
                     if (add.added) {
                         console.log(`✅ ДОБАВЛЕНО: ${prettyTitle}`);
-                        lastPrettyTitle = `📅 ${prettyTitle}`;
+                        lastPrettyTitle = prettyTitle;
                         lastImgUrl = imgUp.url;
                     }
                 }
@@ -134,13 +134,11 @@ async function main() {
         }
 
         if (lastPrettyTitle && lastImgUrl) {
-            console.log(`--- ПОПЫТКА РАССЫЛКИ: ${lastPrettyTitle} ---`);
-            const bRes = await context.request.post(`${SITE_BASE_RAW}/admin_broadcast.php`, {
-                data: { pass: ADMIN_PASS, text: `🔔 Новое изменение!\n\n${lastPrettyTitle}`, img_url: lastImgUrl }
+            await context.request.post(`${SITE_BASE_RAW}/admin_broadcast.php`, {
+                data: { pass: ADMIN_PASS, text: lastPrettyTitle, img_url: lastImgUrl }
             });
-            console.log(`Результат рассылки: ${bRes.status()}`);
         }
-    } catch (err) { console.error('Критическая ошибка:', err.message); }
+    } catch (err) { console.error('Ошибка:', err.message); }
 
     // Очистка сайта
     try {
@@ -156,6 +154,5 @@ async function main() {
     
     await context.request.get(`${SITE_BASE_RAW}/admin_auto_cleanup.php`, { params: { pass: ADMIN_PASS } }).catch(() => {});
     await browser.close();
-    console.log('--- РАБОТА ЗАВЕРШЕНА ---');
 }
 main();
