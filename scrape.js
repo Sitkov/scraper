@@ -1,7 +1,7 @@
 import { chromium } from 'playwright'
 import fs from 'fs'
 
-console.log('--- ЗАПУСК СКРИПТА (STABLE HIGH QUALITY) ---');
+console.log('--- ЗАПУСК СКРИПТА (ВЕРСИЯ С ГЛАЗАМИ) ---');
 
 const DASHBOARD_URL = 'https://t15.ecp.egov66.ru/dashboard'
 const SITE_BASE_RAW = (process.env.SITE_BASE || '').trim().replace(/\/+$/, '')
@@ -34,6 +34,7 @@ function formatRussianTitle(title) {
 async function main() {
     const browser = await chromium.launch();
     const context = await browser.newContext({ 
+        storageState: fs.existsSync('state.json') ? 'state.json' : undefined,
         acceptDownloads: true,
         deviceScaleFactor: 2, 
         viewport: { width: 1200, height: 1600 }
@@ -43,6 +44,19 @@ async function main() {
     try {
         console.log('Загрузка портала...');
         await page.goto(DASHBOARD_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
+        await page.waitForTimeout(5000); 
+
+        const currentUrl = page.url();
+        const pageTitle = await page.title();
+        console.log(`URL: ${currentUrl}`);
+        console.log(`Заголовок: ${pageTitle}`);
+
+        if (currentUrl.includes('esia') || pageTitle.includes('Авторизация') || pageTitle.includes('Вход')) {
+            console.error('❌ ОШИБКА: state.json не работает! Бот вылетел на страницу логина.');
+            await browser.close();
+            return;
+        }
+
         const links = await page.evaluate(() => {
             const anchors = Array.from(document.querySelectorAll('a[href]'));
             return Array.from(new Set(anchors.map(a => a.href).filter(h => /\/news\/show\/\d+$/i.test(h))));
@@ -82,23 +96,19 @@ async function main() {
 
                 const p = await context.newPage();
                 await p.setViewportSize({ width: 1100, height: 1000 });
-                
-                // Используем стабильную версию PDF.js и вешаем расширенный лог
                 await p.setContent(`
                     <html><head>
                         <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
                         <style>body{margin:0;background:#fff;padding:10px} canvas{display:block;margin:0 auto 10px auto; box-shadow: 0 0 10px rgba(0,0,0,0.1)}</style>
                     </head><body><div id="v"></div><script>
-                        const pdfData = atob("${b64Pdf}");
                         pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
-                        
                         async function render() {
                             try {
-                                const pdf = await pdfjsLib.getDocument({data: pdfData}).promise;
+                                const pdf = await pdfjsLib.getDocument({data: atob("${b64Pdf}")}).promise;
                                 const v = document.getElementById('v');
                                 for(let i=1; i<=pdf.numPages; i++) {
                                     const page = await pdf.getPage(i);
-                                    const vp = page.getViewport({scale: 2.5}); // Оптимальное качество
+                                    const vp = page.getViewport({scale: 2.5});
                                     const canvas = document.createElement('canvas');
                                     canvas.width = vp.width; canvas.height = vp.height;
                                     v.appendChild(canvas);
@@ -106,7 +116,6 @@ async function main() {
                                 }
                                 document.body.classList.add('ready');
                             } catch (err) {
-                                document.body.innerText = err.message;
                                 document.body.classList.add('error');
                             }
                         }
@@ -114,16 +123,7 @@ async function main() {
                     </script></body></html>
                 `);
 
-                // Ждем готовности или ошибки
-                await Promise.race([
-                    p.waitForSelector('.ready', { timeout: 60000 }),
-                    p.waitForSelector('.error', { timeout: 60000 })
-                ]);
-
-                if (await p.$('.error')) {
-                    throw new Error('Ошибка внутри PDF.js рендера');
-                }
-
+                await p.waitForSelector('.ready', { timeout: 60000 });
                 const screenshotBuf = await p.screenshot({ type: 'png', fullPage: true });
                 await p.close();
 
@@ -134,20 +134,20 @@ async function main() {
                 const imgRes = await context.request.post(`${SITE_BASE_RAW}/admin_upload_pdf.php`, {
                     data: { pass: ADMIN_PASS, data: screenshotBuf.toString('base64'), name: fileKey, ext: 'png' }
                 });
-                const imgUp = await imgRes.json().catch(()=>({}));
+                const imgUp = await imgRes.json();
 
                 if (imgUp.ok) {
                     const addRes = await context.request.post(`${SITE_BASE_RAW}/admin_change_add.php`, {
                         data: { pass: ADMIN_PASS, title: `📅 ${prettyTitle}`, url: '/api/files/' + fileKey + '.pdf', source: item.newsUrl, img_url: imgUp.url }
                     });
-                    const add = await addRes.json().catch(()=>({}));
+                    const add = await addRes.json();
                     if (add.added) {
                         console.log(`✅ ДОБАВЛЕНО: ${prettyTitle}`);
                         lastPrettyTitle = `📅 ${prettyTitle}`;
                         lastImgUrl = imgUp.url;
                     }
                 }
-            } catch (e) { console.log(`[!] Ошибка на ${item.title}: ${e.message}`); }
+            } catch (e) { console.log(`[!] Ошибка: ${e.message}`); }
         }
 
         if (lastPrettyTitle && lastImgUrl) {
@@ -155,7 +155,7 @@ async function main() {
                 data: { pass: ADMIN_PASS, text: `🔔 Новое изменение!\n\n${lastPrettyTitle}`, img_url: lastImgUrl }
             });
         }
-    } catch (err) { console.error('Критическая ошибка:', err.message); }
+    } catch (err) { console.error('Ошибка главной:', err.message); }
 
     // Очистка сайта
     try {
@@ -171,6 +171,7 @@ async function main() {
     
     await context.request.get(`${SITE_BASE_RAW}/admin_auto_cleanup.php`, { params: { pass: ADMIN_PASS } }).catch(() => {});
     await browser.close();
+    console.log('--- РАБОТА ЗАВЕРШЕНА ---');
 }
 
 main();
