@@ -1,14 +1,14 @@
 import { chromium } from 'playwright'
 import fs from 'fs'
 
-console.log('--- ИНИЦИАЛИЗАЦИЯ СКРИПТА (FINAL BROADCAST FIX) ---');
+console.log('--- ЗАПУСК СКРИПТА (ВЕРСИЯ: ПРОВЕРКА АВТОРИЗАЦИИ) ---');
 
 const DASHBOARD_URL = 'https://t15.ecp.egov66.ru/dashboard'
 const SITE_BASE_RAW = (process.env.SITE_BASE || '').trim().replace(/\/+$/, '')
 const ADMIN_PASS    = (process.env.ADMIN_PASS || '').trim()
 const MAX_KEEP      = 3;
 
-const monthsMap = {'янв':1, 'фев':2, 'мар':3, 'апр':4, 'мая':5, 'июн':6, 'июл':7, 'авг':8, 'сен':9, 'окт':10, 'ноя':11, 'дек':12};
+const monthsMap = {'янв':1, 'фев':2, 'мар':3, 'апр':4, 'мая':5, 'июн':6, 'июл':7, 'вг':8, 'сен':9, 'окт':10, 'ноя':11, 'дек':12};
 const monthsArr = ['января', 'февраля', 'марта', 'апреля', 'мая', 'июня', 'июля', 'августа', 'сентября', 'октября', 'ноября', 'декабря'];
 const daysArr = ['Воскресенье', 'Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота'];
 
@@ -33,30 +33,60 @@ function formatRussianTitle(title) {
 
 async function main() {
     const browser = await chromium.launch();
+    // Проверяем наличие файла сессии
+    const hasState = fs.existsSync('state.json');
+    console.log(hasState ? "Файл state.json загружен" : "⚠️ ПРЕДУПРЕЖДЕНИЕ: state.json не найден!");
+
     const context = await browser.newContext({ 
+        storageState: hasState ? 'state.json' : undefined,
         acceptDownloads: true,
         deviceScaleFactor: 2, 
-        viewport: { width: 1200, height: 1600 }
+        viewport: { width: 1200, height: 1600 },
+        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
     });
+    
     const page = await context.newPage();
 
     try {
         console.log('Загрузка портала...');
-        await page.goto(DASHBOARD_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
-        await page.waitForTimeout(5000); 
+        await page.goto(DASHBOARD_URL, { waitUntil: 'networkidle', timeout: 60000 });
+
+        const currentUrl = page.url();
+        const pageTitle = await page.title();
+        console.log(`Текущий URL: ${currentUrl}`);
+        console.log(`Заголовок страницы: "${pageTitle}"`);
+
+        // ПРОВЕРКА: Если нас выкинуло на логин
+        if (currentUrl.includes('esia.gosuslugi.ru') || pageTitle.includes('вторизац') || pageTitle.includes('Вход')) {
+            console.error('❌ ОШИБКА: Авторизация не удалась. Нужно обновить куки (state.json) в Secrets!');
+            await browser.close();
+            return;
+        }
+
+        // Ждем появления хотя бы одной ссылки на новость
+        await page.waitForSelector('a[href*="/news/show/"]', { timeout: 15000 }).catch(() => {});
 
         const links = await page.evaluate(() => {
-            const anchors = Array.from(document.querySelectorAll('a[href]'));
-            return Array.from(new Set(anchors.map(a => a.href).filter(h => /\/news\/show\/\d+$/i.test(h))));
+            const anchors = Array.from(document.querySelectorAll('a[href*="/news/show/"]'));
+            return Array.from(new Set(anchors.map(a => a.href)));
         });
         
         console.log(`Найдено ссылок: ${links.length}`);
+        
+        if (links.length === 0) {
+            console.log('Новостей на странице не найдено. Проверьте структуру сайта.');
+            await browser.close();
+            return;
+        }
+
         let foundNews = [];
         for (const url of links.slice(0, 10)) {
             const p = await context.newPage();
             try {
                 await p.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
-                const title = (await p.innerText('h1, h2, .title').catch(() => '')).trim();
+                const title = (await p.innerText('h1, h2, .title, .news-title').catch(() => '')).trim();
+                console.log(`Проверка: ${title}`);
+
                 if (title.toLowerCase().includes('изменени')) {
                     const pdfLink = await p.getAttribute('a[href*=".pdf"], a[href*="/download/"]', 'href');
                     if (pdfLink) {
@@ -64,7 +94,7 @@ async function main() {
                         foundNews.push({ title, url: fullPdfUrl, newsUrl: url });
                     }
                 }
-            } catch (e) {}
+            } catch (e) { console.log(`Не удалось прочитать новость: ${url}`); }
             await p.close();
         }
 
@@ -121,29 +151,29 @@ async function main() {
 
                 if (imgUp.ok) {
                     const addRes = await context.request.post(`${SITE_BASE_RAW}/admin_change_add.php`, {
-                        data: { pass: ADMIN_PASS, title: `📅 ${prettyTitle}`, url: '/api/files/' + fileKey + '.pdf', source: item.newsUrl, img_url: imgUp.url }
+                        data: { pass: ADMIN_PASS, title: prettyTitle, url: '/api/files/' + fileKey + '.pdf', source: item.newsUrl, img_url: imgUp.url }
                     });
                     const add = await addRes.json().catch(()=>({}));
                     if (add.added) {
                         console.log(`✅ ДОБАВЛЕНО: ${prettyTitle}`);
-                        lastPrettyTitle = `📅 ${prettyTitle}`;
+                        lastPrettyTitle = prettyTitle;
                         lastImgUrl = imgUp.url;
                     }
                 }
-            } catch (e) { console.log(`Ошибка: ${e.message}`); }
+            } catch (e) { console.log(`Ошибка файла: ${e.message}`); }
         }
 
         if (lastPrettyTitle && lastImgUrl) {
-            console.log(`--- ПОПЫТКА РАССЫЛКИ: ${lastPrettyTitle} ---`);
+            console.log(`--- ВЫЗОВ РАССЫЛКИ ---`);
             const bRes = await context.request.post(`${SITE_BASE_RAW}/admin_broadcast.php`, {
                 data: { pass: ADMIN_PASS, text: `🔔 Новое изменение!\n\n${lastPrettyTitle}`, img_url: lastImgUrl }
             });
             const bData = await bRes.json().catch(() => ({}));
-            console.log(`Результат: ${bRes.status()}, Отправлено: ${bData.sent || 0} сообщений`);
+            console.log(`Отправлено: ${bData.sent || 0}`);
         }
-    } catch (err) { console.error('Ошибка главной:', err.message); }
+    } catch (err) { console.error('Критическая ошибка:', err.message); }
 
-    // Очистка сайта (оставляем 3)
+    // Очистка сайта
     try {
         const listRes = await context.request.get(`${SITE_BASE_RAW}/admin_change_list.php`, { params: { pass: ADMIN_PASS } });
         const data = await listRes.json();
@@ -159,4 +189,5 @@ async function main() {
     await browser.close();
     console.log('--- РАБОТА ЗАВЕРШЕНА ---');
 }
+
 main();
