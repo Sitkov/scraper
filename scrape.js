@@ -1,7 +1,7 @@
 import { chromium } from 'playwright'
 import fs from 'fs'
 
-console.log('--- ИНИЦИАЛИЗАЦИЯ СКРИПТА (FINAL STABLE VERSION) ---');
+console.log('--- ЗАПУСК СКРИПТА (MAX QUALITY & CLEAN CAPTION) ---');
 
 const DASHBOARD_URL = 'https://t15.ecp.egov66.ru/dashboard'
 const SITE_BASE_RAW = (process.env.SITE_BASE || '').trim().replace(/\/+$/, '')
@@ -26,14 +26,9 @@ function formatRussianTitle(title) {
         const d = parseInt(match[1]);
         const m = (match[2].length <= 2) ? parseInt(match[2]) : monthsMap[match[2].toLowerCase().slice(0, 3)];
         const dateObj = new Date(new Date().getFullYear(), m - 1, d);
-        return `📅 ${daysArr[dateObj.getDay()]} - ${d} ${monthsArr[m - 1]}`;
+        return `${daysArr[dateObj.getDay()]} - ${d} ${monthsArr[m - 1]}`;
     }
-    return `📅 ${title}`;
-}
-
-async function parseResponse(response, label) {
-    const text = await response.text();
-    try { return JSON.parse(text); } catch (e) { return { ok: false }; }
+    return title;
 }
 
 async function main() {
@@ -41,28 +36,20 @@ async function main() {
     const context = await browser.newContext({ 
         storageState: fs.existsSync('state.json') ? 'state.json' : undefined,
         acceptDownloads: true,
+        deviceScaleFactor: 2, // Физическое увеличение плотности пикселей
         viewport: { width: 1200, height: 1600 }
     });
     const page = await context.newPage();
 
     try {
         console.log('Загрузка портала...');
-        const response = await page.goto(DASHBOARD_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
-        await page.waitForTimeout(5000); 
-
-        console.log(`Страница: ${page.url()}`);
-        console.log(`Заголовок: "${await page.title()}"`);
-
+        await page.goto(DASHBOARD_URL, { waitUntil: 'domcontentloaded', timeout: 60000 });
         const links = await page.evaluate(() => {
             const anchors = Array.from(document.querySelectorAll('a[href]'));
             return Array.from(new Set(anchors.map(a => a.href).filter(h => /\/news\/show\/\d+$/i.test(h))));
         });
         
-        console.log(`Найдено ссылок: ${links.length}`);
-        
-        // Массив для хранения данных новостей перед обработкой
         let foundNews = [];
-
         for (const url of links.slice(0, 10)) {
             const p = await context.newPage();
             try {
@@ -79,9 +66,7 @@ async function main() {
             await p.close();
         }
 
-        // Сортировка по календарной дате
         foundNews.sort((a, b) => parseNewsDate(a.title) - parseNewsDate(b.title));
-
         let lastPrettyTitle = null;
         let lastImgUrl = null;
 
@@ -94,20 +79,19 @@ async function main() {
                 const pdfBuf = await pdfResp.body();
                 const b64Pdf = pdfBuf.toString('base64');
 
-                // Рендеринг в длинную картинку через PDF.js
                 const p = await context.newPage();
                 await p.setViewportSize({ width: 1000, height: 1000 });
                 await p.setContent(`
                     <html><head>
                         <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
-                        <style>body{margin:0;background:#fff} canvas{display:block;margin:0 auto;border-bottom:2px solid #ccc}</style>
+                        <style>body{margin:0;background:#fff} canvas{display:block;margin:0 auto;}</style>
                     </head><body><div id="v"></div><script>
                         pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
                         pdfjsLib.getDocument({data: atob("${b64Pdf}")}).promise.then(async (pdf) => {
                             const v = document.getElementById('v');
                             for(let i=1; i<=pdf.numPages; i++) {
                                 const page = await pdf.getPage(i);
-                                const vp = page.getViewport({scale: 2.0});
+                                const vp = page.getViewport({scale: 3.0}); // ВЫСОКОЕ КАЧЕСТВО
                                 const canvas = document.createElement('canvas');
                                 canvas.width = vp.width; canvas.height = vp.height;
                                 v.appendChild(canvas);
@@ -133,26 +117,26 @@ async function main() {
 
                 if (imgUp.ok) {
                     const addRes = await context.request.post(`${SITE_BASE_RAW}/admin_change_add.php`, {
-                        data: { pass: ADMIN_PASS, title: prettyTitle, url: '/api/files/' + fileKey + '.pdf', source: item.newsUrl, img_url: imgUp.url }
+                        data: { pass: ADMIN_PASS, title: `📅 ${prettyTitle}`, url: '/api/files/' + fileKey + '.pdf', source: item.newsUrl, img_url: imgUp.url }
                     });
                     const add = await addRes.json();
                     if (add.added) {
                         console.log(`✅ ДОБАВЛЕНО: ${prettyTitle}`);
-                        lastPrettyTitle = prettyTitle;
+                        lastPrettyTitle = `📅 ${prettyTitle}`;
                         lastImgUrl = imgUp.url;
                     }
                 }
             } catch (e) { console.log(`Ошибка: ${e.message}`); }
         }
 
-        if (lastPrettyTitle) {
+        if (lastPrettyTitle && lastImgUrl) {
             await context.request.post(`${SITE_BASE_RAW}/admin_broadcast.php`, {
                 data: { pass: ADMIN_PASS, text: `🔔 Новое изменение!\n\n${lastPrettyTitle}`, img_url: lastImgUrl }
             });
         }
-    } catch (err) { console.error('Критическая ошибка:', err.message); }
+    } catch (err) { console.error('Ошибка:', err.message); }
 
-    // Очистка сайта
+    // Очистка сайта (оставляем 3)
     try {
         const listRes = await context.request.get(`${SITE_BASE_RAW}/admin_change_list.php`, { params: { pass: ADMIN_PASS } });
         const data = await listRes.json();
