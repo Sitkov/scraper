@@ -1,7 +1,7 @@
 import { chromium } from 'playwright'
 import fs from 'fs'
 
-console.log('--- ЗАПУСК СКРИПТА (MAX QUALITY & FIXED BROADCAST) ---');
+console.log('--- ЗАПУСК СКРИПТА (MAX QUALITY VERSION) ---');
 
 const DASHBOARD_URL = 'https://t15.ecp.egov66.ru/dashboard'
 const SITE_BASE_RAW = (process.env.SITE_BASE || '').trim().replace(/\/+$/, '')
@@ -67,15 +67,12 @@ async function main() {
         }
 
         foundNews.sort((a, b) => parseNewsDate(a.title) - parseNewsDate(b.title));
-
         let lastPrettyTitle = null;
         let lastImgUrl = null;
 
         for (const item of foundNews) {
             try {
                 const prettyTitle = formatRussianTitle(item.title);
-                console.log(`Обработка: ${prettyTitle}`);
-
                 const pdfResp = await context.request.get(item.url);
                 const pdfBuf = await pdfResp.body();
                 const b64Pdf = pdfBuf.toString('base64');
@@ -94,7 +91,7 @@ async function main() {
                                 const page = await pdf.getPage(i);
                                 const vp = page.getViewport({scale: 3.0}); 
                                 const canvas = document.createElement('canvas');
-                                canvas.width = vp.width; canvas.height = vp.height;
+                                canvas.width = viewport.width; canvas.height = viewport.height;
                                 v.appendChild(canvas);
                                 await page.render({canvasContext: canvas.getContext('2d'), viewport: vp}).promise;
                             }
@@ -124,22 +121,16 @@ async function main() {
                     if (add.added) {
                         console.log(`✅ ДОБАВЛЕНО: ${prettyTitle}`);
                         lastPrettyTitle = `📅 ${prettyTitle}`;
-                        lastImgUrl = imgUp.url; // Сохраняем ссылку для рассылки
+                        lastImgUrl = imgUp.url;
                     }
                 }
             } catch (e) { console.log(`Ошибка: ${e.message}`); }
         }
 
         if (lastPrettyTitle) {
-            console.log('Вызываю рассылку...');
-            const broadcastRes = await context.request.post(`${SITE_BASE_RAW}/admin_broadcast.php`, {
-                data: { 
-                    pass: ADMIN_PASS, 
-                    text: `🔔 Новое изменение!\n\n${lastPrettyTitle}`, 
-                    img_url: lastImgUrl // ПЕРЕДАЕМ КАРТИНКУ В БОТА
-                }
+            await context.request.post(`${SITE_BASE_RAW}/admin_broadcast.php`, {
+                data: { pass: ADMIN_PASS, text: `🔔 Новое изменение!\n\n${lastPrettyTitle}`, img_url: lastImgUrl }
             });
-            console.log('Статус рассылки:', broadcastRes.status());
         }
     } catch (err) { console.error('Ошибка:', err.message); }
 
@@ -155,8 +146,7 @@ async function main() {
         }
     } catch (e) {}
     
-    await context.request.get(`${SITE_BASE_RAW}/admin_auto_cleanup.php`, { params: { pass: ADMIN_PASS } }).catch(() => {});
     await browser.close();
-    console.log('--- РАБОТА ЗАВЕРШЕНА ---');
 }
+
 main();
