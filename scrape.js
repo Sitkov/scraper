@@ -22,96 +22,117 @@ function getCorrectTitle(rawTitle) {
 }
 
 async function main() {
-    console.log("🚀 Запуск скрипта...");
+    console.log("🚀 Старт...");
     const browser = await chromium.launch();
-    const context = await browser.newContext({ deviceScaleFactor: 2 });
+    // Добавляем нормальный User-Agent, чтобы не палиться
+    const context = await browser.newContext({ 
+        userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36',
+        deviceScaleFactor: 2 
+    });
     const page = await context.newPage();
 
     try {
-        console.log(`🔗 Переход на ${DASHBOARD_URL}`);
+        console.log(`🔗 Открываю: ${DASHBOARD_URL}`);
         await page.goto(DASHBOARD_URL, { waitUntil: 'networkidle', timeout: 60000 });
         
-        const links = await page.evaluate(() => 
-            Array.from(new Set(Array.from(document.querySelectorAll('a[href*="/news/show/"]')).map(a => a.href)))
-        );
+        // Ждем хотя бы одну ссылку на новость (даже если селектор чуть другой)
+        await page.waitForSelector('a', { timeout: 10000 }).catch(() => console.log("⏳ Ссылки долго грузятся..."));
 
-        console.log(`🔎 Найдено новостей: ${links.length}`);
+        // Собираем ВСЕ ссылки на странице и ищем те, где есть news и цифры
+        const links = await page.evaluate(() => {
+            return Array.from(document.querySelectorAll('a'))
+                .map(a => a.href)
+                .filter(href => href.includes('/news/') || href.match(/\/\d+$/)); 
+        });
 
-        if (links.length === 0) {
-            console.log("❌ Ссылок на новости не найдено. Проверь селекторы.");
+        // Убираем дубликаты
+        const uniqueLinks = [...new Set(links)];
+        console.log(`🔎 Найдено потенциальных ссылок: ${uniqueLinks.length}`);
+
+        if (uniqueLinks.length === 0) {
+            console.log("❌ Ссылок ноль. Делаю скриншот страницы для проверки...");
+            await page.screenshot({ path: 'page_error.png', fullPage: true });
         }
 
-        for (const url of links.slice(0, 2)) {
-            console.log(`\n📄 Проверяю новость: ${url}`);
+        for (const url of uniqueLinks.slice(0, 3)) {
+            console.log(`\n📄 Захожу в новость: ${url}`);
             const p = await context.newPage();
-            await p.goto(url, { waitUntil: 'networkidle' });
-            
-            const rawTitle = (await p.innerText('h1, h2, .title').catch(() => 'Без заголовка')).trim();
-            console.log(`📝 Заголовок: "${rawTitle}"`);
-            
-            // Проверка на ключевое слово (убрал строгость)
-            if (rawTitle.toLowerCase().includes('изменен')) {
-                console.log("✅ Это новость про изменения. Ищу PDF...");
-                const pdfLink = await p.evaluate(() => document.querySelector('a[href*=".pdf"]')?.href);
-
-                if (pdfLink) {
-                    console.log(`📎 PDF найден: ${pdfLink}`);
-                    const pdfResp = await context.request.get(pdfLink);
-                    const pdfBuf = await pdfResp.body();
-                    const b64Pdf = pdfBuf.toString('base64');
-                    const fileKey = `ch_${Date.now()}`;
-                    const title = getCorrectTitle(rawTitle);
-
-                    console.log("🎨 Рендерю скриншот PDF...");
-                    const renderPage = await context.newPage();
-                    await renderPage.setViewportSize({ width: 1000, height: 1200 });
-                    await renderPage.setContent(`
-                        <html><head><script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script></head>
-                        <body style="margin:0"><div id="v"></div><script>
-                            pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
-                            pdfjsLib.getDocument({data: atob("${b64Pdf}")}).promise.then(async pdf => {
-                                const page = await pdf.getPage(1);
-                                const vp = page.getViewport({scale: 2.5});
-                                const canvas = document.createElement('canvas');
-                                canvas.width = vp.width; canvas.height = vp.height;
-                                document.getElementById('v').appendChild(canvas);
-                                await page.render({canvasContext: canvas.getContext('2d'), viewport: vp}).promise;
-                                window.ready = true;
-                            });
-                        </script></body></html>
-                    `);
-
-                    await renderPage.waitForFunction(() => window.ready, { timeout: 30000 });
-                    const imgBuf = await renderPage.screenshot({ type: 'jpeg', quality: 85, fullPage: true });
-                    await renderPage.close();
-
-                    console.log("📡 Отправляю данные на сервер...");
-                    await context.request.post(`${SITE_BASE_RAW}/admin_upload_pdf.php`, { data: { pass: ADMIN_PASS, data: b64Pdf, name: fileKey, ext: 'pdf' } });
-                    const imgRes = await context.request.post(`${SITE_BASE_RAW}/admin_upload_pdf.php`, { data: { pass: ADMIN_PASS, data: imgBuf.toString('base64'), name: fileKey, ext: 'jpg' } });
-                    const imgData = await imgRes.json().catch(() => ({}));
-
-                    const addRes = await context.request.post(`${SITE_BASE_RAW}/admin_change_add.php`, {
-                        data: { pass: ADMIN_PASS, title: title, url: `/api/files/${fileKey}.pdf`, source: url, img_url: imgData.url }
+            try {
+                await p.goto(url, { waitUntil: 'networkidle', timeout: 30000 });
+                
+                const rawTitle = (await p.innerText('h1, h2, .news-title, .title').catch(() => '')).trim();
+                console.log(`📝 Заголовок: "${rawTitle}"`);
+                
+                // Проверяем на "изменен" (регистр не важен)
+                if (rawTitle.toLowerCase().includes('изменен')) {
+                    console.log("✅ Нашел изменения! Ищу PDF...");
+                    
+                    const pdfLink = await p.evaluate(() => {
+                        const a = document.querySelector('a[href*=".pdf"], a[href*="download"]');
+                        return a ? a.href : null;
                     });
-                    console.log("📥 Результат добавления:", await addRes.text());
 
-                    const broadRes = await context.request.post(`${SITE_BASE_RAW}/admin_broadcast.php`, {
-                        data: { pass: ADMIN_PASS, text: `🔔 <b>${title}</b>` }
-                    });
-                    console.log("📢 Результат рассылки:", await broadRes.text());
+                    if (pdfLink) {
+                        console.log(`📎 PDF найден: ${pdfLink}`);
+                        const pdfResp = await context.request.get(pdfLink);
+                        const pdfBuf = await pdfResp.body();
+                        const b64Pdf = pdfBuf.toString('base64');
+                        const fileKey = `ch_${Date.now()}`;
+                        const title = getCorrectTitle(rawTitle);
+
+                        console.log("🎨 Рисую скриншот...");
+                        const renderPage = await context.newPage();
+                        await renderPage.setViewportSize({ width: 1000, height: 1200 });
+                        await renderPage.setContent(`
+                            <html><head><script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script></head>
+                            <body style="margin:0"><div id="v"></div><script>
+                                pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+                                pdfjsLib.getDocument({data: atob("${b64Pdf}")}).promise.then(async pdf => {
+                                    const page = await pdf.getPage(1);
+                                    const vp = page.getViewport({scale: 2.5});
+                                    const canvas = document.createElement('canvas');
+                                    canvas.width = vp.width; canvas.height = vp.height;
+                                    document.getElementById('v').appendChild(canvas);
+                                    await page.render({canvasContext: canvas.getContext('2d'), viewport: vp}).promise;
+                                    window.ready = true;
+                                }).catch(e => console.error(e));
+                            </script></body></html>
+                        `);
+
+                        await renderPage.waitForFunction(() => window.ready, { timeout: 20000 }).catch(() => console.log("⚠️ Рендер PDF затянулся..."));
+                        const imgBuf = await renderPage.screenshot({ type: 'jpeg', quality: 90 });
+                        await renderPage.close();
+
+                        console.log("📡 Загрузка на хостинг...");
+                        await context.request.post(`${SITE_BASE_RAW}/admin_upload_pdf.php`, { data: { pass: ADMIN_PASS, data: b64Pdf, name: fileKey, ext: 'pdf' } });
+                        const imgRes = await context.request.post(`${SITE_BASE_RAW}/admin_upload_pdf.php`, { data: { pass: ADMIN_PASS, data: imgBuf.toString('base64'), name: fileKey, ext: 'jpg' } });
+                        const imgData = await imgRes.json().catch(() => ({}));
+
+                        await context.request.post(`${SITE_BASE_RAW}/admin_change_add.php`, {
+                            data: { pass: ADMIN_PASS, title: title, url: `/api/files/${fileKey}.pdf`, source: url, img_url: imgData.url || '' }
+                        });
+
+                        await context.request.post(`${SITE_BASE_RAW}/admin_broadcast.php`, {
+                            data: { pass: ADMIN_PASS, text: `🔔 <b>${title}</b>` }
+                        });
+                        console.log("🚀 Всё готово!");
+                    } else {
+                        console.log("⏭️ В этой новости нет PDF.");
+                    }
                 } else {
-                    console.log("⚠️ PDF файл в новости не найден.");
+                    console.log("⏭️ Не про изменения.");
                 }
-            } else {
-                console.log("⏭️ Пропускаю (не относится к изменениям).");
+            } catch (e) {
+                console.log(`❌ Ошибка в новости: ${e.message}`);
+            } finally {
+                await p.close();
             }
-            await p.close();
         }
     } catch (err) {
-        console.error("⛔ Критическая ошибка скрипта:", err);
+        console.error("⛔ Глобальная ошибка:", err);
     } finally {
         await browser.close();
-        console.log("🏁 Скрипт завершен.");
+        console.log("🏁 Завершено.");
     }
 }
 main();
