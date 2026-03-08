@@ -12,42 +12,66 @@ async function main() {
     const page = await context.newPage();
 
     try {
-        await page.goto(DASHBOARD_URL, { waitUntil: 'networkidle' });
+        console.log('Захожу на дашборд...');
+        await page.goto(DASHBOARD_URL, { waitUntil: 'networkidle', timeout: 60000 });
+        
         const links = await page.evaluate(() => {
             return Array.from(new Set(Array.from(document.querySelectorAll('a[href*="/news/show/"]')).map(a => a.href)));
         });
         
+        console.log(`Найдено новостей: ${links.length}`);
+
         for (const url of links.slice(0, 1)) {
+            console.log(`Проверяю новость: ${url}`);
             const p = await context.newPage();
-            await p.goto(url, { waitUntil: 'networkidle' });
-            const title = (await p.innerText('h1, h2').catch(() => 'Изменения')).trim();
-            
-            if (title.toLowerCase().includes('изменени')) {
-                const pdfLink = await p.getAttribute('a[href*=".pdf"]', 'href');
-                if (pdfLink) {
-                    const fullPdfUrl = pdfLink.startsWith('http') ? pdfLink : new URL(pdfLink, DASHBOARD_URL).href;
-                    const pdfResp = await context.request.get(fullPdfUrl);
-                    const pdfBuf = await pdfResp.body();
-                    const fileKey = `ch_${Date.now()}`;
-
-                    // Загружаем только PDF
-                    await context.request.post(`${SITE_BASE_RAW}/admin_upload_pdf.php`, {
-                        data: { pass: ADMIN_PASS, data: pdfBuf.toString('base64'), name: fileKey, ext: 'pdf' }
+            try {
+                await p.goto(url, { waitUntil: 'networkidle', timeout: 40000 });
+                const title = (await p.innerText('h1, h2, .title').catch(() => 'Изменения')).trim();
+                
+                if (title.toLowerCase().includes('изменени')) {
+                    // Ищем любую ссылку, похожую на документ
+                    const pdfLink = await p.evaluate(() => {
+                        const anchor = document.querySelector('a[href*=".pdf"], a[href*="/download/"], a[class*="download"]');
+                        return anchor ? anchor.href : null;
                     });
 
-                    // Добавляем в список на сайт
-                    await context.request.post(`${SITE_BASE_RAW}/admin_change_add.php`, {
-                        data: { pass: ADMIN_PASS, title: title, url: `/api/files/${fileKey}.pdf` }
-                    });
+                    if (pdfLink) {
+                        console.log(`Найден PDF: ${pdfLink}`);
+                        const pdfResp = await context.request.get(pdfLink);
+                        const pdfBuf = await pdfResp.body();
+                        const fileKey = `ch_${Date.now()}`;
 
-                    // Запуск рассылки (передаем путь к PDF)
-                    await context.request.post(`${SITE_BASE_RAW}/admin_broadcast.php`, {
-                        data: { pass: ADMIN_PASS, text: `🔔 <b>${title}</b>`, pdf_url: `/api/files/${fileKey}.pdf` }
-                    });
+                        // Загружаем PDF на хостинг
+                        await context.request.post(`${SITE_BASE_RAW}/admin_upload_pdf.php`, {
+                            data: { pass: ADMIN_PASS, data: pdfBuf.toString('base64'), name: fileKey, ext: 'pdf' }
+                        });
+
+                        // Добавляем запись в базу
+                        await context.request.post(`${SITE_BASE_RAW}/admin_change_add.php`, {
+                            data: { pass: ADMIN_PASS, title: title, url: `/api/files/${fileKey}.pdf` }
+                        });
+
+                        // Рассылка файла
+                        await context.request.post(`${SITE_BASE_RAW}/admin_broadcast.php`, {
+                            data: { pass: ADMIN_PASS, text: `🔔 <b>${title}</b>`, pdf_url: `/api/files/${fileKey}.pdf` }
+                        });
+                        console.log('Готово! Файл отправлен.');
+                    } else {
+                        console.log('⚠️ Ссылка на PDF не найдена на странице новости.');
+                        // Делаем скриншот для дебага, если хочешь увидеть, что не так
+                        await p.screenshot({ path: 'debug_error.png' });
+                    }
                 }
+            } catch (e) {
+                console.log(`Ошибка при обработке новости: ${e.message}`);
+            } finally {
+                await p.close();
             }
-            await p.close();
         }
-    } finally { await browser.close(); }
+    } catch (err) {
+        console.error('Критическая ошибка:', err.message);
+    } finally {
+        await browser.close();
+    }
 }
 main();
