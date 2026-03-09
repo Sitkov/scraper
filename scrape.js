@@ -167,10 +167,10 @@ async function main() {
 
         // 4. Рассылка
         if (lastPrettyTitle && lastImgUrl) {
-            //console.log(`Отправка рассылки: ${lastPrettyTitle}`);
-            //await context.request.post(`${SITE_BASE_RAW}/admin_broadcast.php`, {
-            //    data: { pass: ADMIN_PASS, text: lastPrettyTitle, img_url: lastImgUrl }
-            //});
+            console.log(`Отправка рассылки: ${lastPrettyTitle}`);
+            await context.request.post(`${SITE_BASE_RAW}/admin_broadcast.php`, {
+                data: { pass: ADMIN_PASS, text: lastPrettyTitle, img_url: lastImgUrl }
+            });
         }
     } catch (err) { console.error('Критическая ошибка:', err.message); }
 
