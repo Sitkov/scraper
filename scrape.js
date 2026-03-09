@@ -116,15 +116,12 @@ async function main() {
                 `);
 
                 await p.waitForSelector('.ready', { timeout: 60000 });
-                
-                // РЕШЕНИЕ ПРОБЛЕМЫ: Сразу делаем легкий JPEG качества 85%, а не тяжелый PNG!
                 const screenshotBuf = await p.screenshot({ type: 'jpeg', quality: 85, fullPage: true });
                 await p.close();
 
                 const fileKey = `ch_${Date.now()}`;
                 
-                // 1. Грузим PDF
-                // Добавляем пароль в URL для страховки от редиректов
+                // Передаем пароль и в теле запроса, и в URL (на случай редиректов хостинга)
                 const uploadUrl = `${SITE_BASE_RAW}/admin_upload_pdf.php?pass=${encodeURIComponent(ADMIN_PASS)}`;
                 
                 // 1. Грузим PDF
@@ -133,73 +130,20 @@ async function main() {
                 });
                 if (!pdfUpRes.ok()) console.log(`⚠️ Ошибка загрузки PDF: HTTP ${pdfUpRes.status()}`);
 
-                // 2. Грузим скриншот
+                // 2. Грузим скриншот (jpg)
                 const imgRes = await context.request.post(uploadUrl, {
                     data: { pass: ADMIN_PASS, data: screenshotBuf.toString('base64'), name: fileKey, ext: 'jpg' }
                 });
-                if (!pdfUpRes.ok()) console.log(`⚠️ Ошибка загрузки PDF: HTTP ${pdfUpRes.status()}`);
-
-                // 2. Грузим скриншот (шлем как jpg, он легкий, лимит хостинга не порвет)
-                const imgRes = await context.request.post(`${SITE_BASE_RAW}/admin_upload_pdf.php`, {
-                    data: { pass: ADMIN_PASS, data: screenshotBuf.toString('base64'), name: fileKey, ext: 'jpg' }
-                });
                 
-                // Жесткий отлов ошибок: если сервер ответил не JSON, мы это увидим в логах
                 const imgText = await imgRes.text();
                 let imgUp = {};
                 try { 
                     imgUp = JSON.parse(imgText); 
                 } catch(e) { 
-                    console.log(`❌ СЕРВЕР ВЕРНУЛ ОШИБКУ (Картинка): ${imgText.substring(0, 300)}`); 
+                    console.log(`❌ ОШИБКА ХОСТИНГА (Картинка): ${imgText.substring(0, 200)}`); 
                 }
 
                 if (imgUp.ok) {
                     // 3. Записываем в БД
                     const addRes = await context.request.post(`${SITE_BASE_RAW}/admin_change_add.php`, {
-                        data: { pass: ADMIN_PASS, title: prettyTitle, url: '/api/files/' + fileKey + '.pdf', source: item.newsUrl, img_url: imgUp.url }
-                    });
-                    
-                    const addText = await addRes.text();
-                    let add = {};
-                    try { 
-                        add = JSON.parse(addText); 
-                    } catch(e) { 
-                        console.log(`❌ СЕРВЕР ВЕРНУЛ ОШИБКУ (БД): ${addText.substring(0, 300)}`); 
-                    }
-
-                    if (add.added) {
-                        console.log(`✅ ДОБАВЛЕНО В БАЗУ: ${prettyTitle}`);
-                        lastPrettyTitle = prettyTitle;
-                        lastImgUrl = imgUp.url;
-                    }
-                }
-            } catch (e) { console.log(`Ошибка при обработке PDF: ${e.message}`); }
-        }
-
-        // 4. Рассылка
-        if (lastPrettyTitle && lastImgUrl) {
-            console.log(`Отправка рассылки: ${lastPrettyTitle}`);
-            await context.request.post(`${SITE_BASE_RAW}/admin_broadcast.php`, {
-                data: { pass: ADMIN_PASS, text: lastPrettyTitle, img_url: lastImgUrl }
-            });
-        }
-    } catch (err) { console.error('Критическая ошибка:', err.message); }
-
-    // 5. Очистка старых записей
-    try {
-        const listRes = await context.request.get(`${SITE_BASE_RAW}/admin_change_list.php`, { params: { pass: ADMIN_PASS } });
-        const data = await listRes.json();
-        if (data.items && data.items.length > MAX_KEEP) {
-            const sorted = data.items.map(it => ({ ...it, w: parseNewsDate(it.title) })).sort((a,b) => b.w - a.w);
-            for (const it of sorted.slice(MAX_KEEP)) {
-                await context.request.post(`${SITE_BASE_RAW}/admin_change_delete.php`, { data: { pass: ADMIN_PASS, id: it.id } });
-            }
-        }
-    } catch (e) {}
-    
-    await context.request.get(`${SITE_BASE_RAW}/admin_auto_cleanup.php`, { params: { pass: ADMIN_PASS } }).catch(() => {});
-    await browser.close();
-    console.log('--- СКРИПТ УСПЕШНО ЗАВЕРШЕН ---');
-}
-
-main();
+                        data: { pass: ADMIN_PASS, title: prettyTitle, url: '/api/files/' + fileKey + '.pdf', source: item.newsUrl, img_url: imgUp.ur
