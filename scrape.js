@@ -121,7 +121,6 @@ async function main() {
 
                 const fileKey = `ch_${Date.now()}`;
                 
-                // Передаем пароль и в теле запроса, и в URL (на случай редиректов хостинга)
                 const uploadUrl = `${SITE_BASE_RAW}/admin_upload_pdf.php?pass=${encodeURIComponent(ADMIN_PASS)}`;
                 
                 // 1. Грузим PDF
@@ -146,4 +145,50 @@ async function main() {
                 if (imgUp.ok) {
                     // 3. Записываем в БД
                     const addRes = await context.request.post(`${SITE_BASE_RAW}/admin_change_add.php`, {
-                        data: { pass: ADMIN_PASS, title: prettyTitle, url: '/api/files/' + fileKey + '.pdf', source: item.newsUrl, img_url: imgUp.ur
+                        data: { pass: ADMIN_PASS, title: prettyTitle, url: '/api/files/' + fileKey + '.pdf', source: item.newsUrl, img_url: imgUp.url }
+                    });
+                    
+                    const addText = await addRes.text();
+                    let add = {};
+                    try { 
+                        add = JSON.parse(addText); 
+                    } catch(e) { 
+                        console.log(`❌ ОШИБКА ХОСТИНГА (БД): ${addText.substring(0, 200)}`); 
+                    }
+
+                    if (add.added) {
+                        console.log(`✅ ДОБАВЛЕНО В БАЗУ: ${prettyTitle}`);
+                        lastPrettyTitle = prettyTitle;
+                        lastImgUrl = imgUp.url;
+                    }
+                }
+            } catch (e) { console.log(`Ошибка при обработке PDF: ${e.message}`); }
+        }
+
+        // 4. Рассылка
+        if (lastPrettyTitle && lastImgUrl) {
+            console.log(`Отправка рассылки: ${lastPrettyTitle}`);
+            await context.request.post(`${SITE_BASE_RAW}/admin_broadcast.php`, {
+                data: { pass: ADMIN_PASS, text: lastPrettyTitle, img_url: lastImgUrl }
+            });
+        }
+    } catch (err) { console.error('Критическая ошибка:', err.message); }
+
+    // 5. Очистка старых записей
+    try {
+        const listRes = await context.request.get(`${SITE_BASE_RAW}/admin_change_list.php`, { params: { pass: ADMIN_PASS } });
+        const data = await listRes.json();
+        if (data.items && data.items.length > MAX_KEEP) {
+            const sorted = data.items.map(it => ({ ...it, w: parseNewsDate(it.title) })).sort((a,b) => b.w - a.w);
+            for (const it of sorted.slice(MAX_KEEP)) {
+                await context.request.post(`${SITE_BASE_RAW}/admin_change_delete.php`, { data: { pass: ADMIN_PASS, id: it.id } });
+            }
+        }
+    } catch (e) {}
+    
+    await context.request.get(`${SITE_BASE_RAW}/admin_auto_cleanup.php`, { params: { pass: ADMIN_PASS } }).catch(() => {});
+    await browser.close();
+    console.log('--- СКРИПТ УСПЕШНО ЗАВЕРШЕН ---');
+}
+
+main();
