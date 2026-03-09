@@ -1,16 +1,16 @@
-import { chromium } from 'playwright'
-import fs from 'fs'
+import { chromium } from 'playwright';
+import fs from 'fs';
 
 console.log('--- ЗАПУСК СКРИПТА (STABLE VERSION) ---');
 
-const DASHBOARD_URL = 'https://t15.ecp.egov66.ru/dashboard'
-const SITE_BASE_RAW = (process.env.SITE_BASE || '').trim().replace(/\/+$/, '')
-const ADMIN_PASS    = (process.env.ADMIN_PASS || '').trim()
+const DASHBOARD_URL = 'https://t15.ecp.egov66.ru/dashboard';
+const SITE_BASE_RAW = (process.env.SITE_BASE || '').trim().replace(/\/+$/, '');
+const ADMIN_PASS    = (process.env.ADMIN_PASS || '').trim();
 const MAX_KEEP      = 3;
 
-const monthsMap = {'янв':1, 'фев':2, 'мар':3, 'апр':4, 'мая':5, 'июн':6, 'июл':7, 'вг':8, 'сен':9, 'окт':10, 'ноя':11, 'дек':12};
-const monthsArr = ['января', 'февраля', 'марта', 'апреля', 'мая', 'июня', 'июля', 'августа', 'сентября', 'октября', 'ноября', 'декабря'];
-const daysArr = ['Воскресенье', 'Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота'];
+const monthsMap = {'янв':1, 'фев':2, 'мар':3, 'апр':4, 'мая':5, 'июн':6, 'июл':7, 'авг':8, 'сен':9, 'окт':10, 'ноя':11, 'дек':12};
+const monthsArr =['января', 'февраля', 'марта', 'апреля', 'мая', 'июня', 'июля', 'августа', 'сентября', 'октября', 'ноября', 'декабря'];
+const daysArr =['Воскресенье', 'Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота'];
 
 function parseNewsDate(title) {
     let match = title.match(/(\d{1,2})\s+([а-яё]+)/i) || title.match(/(\d{1,2})\.(\d{1,2})/);
@@ -26,18 +26,28 @@ function formatRussianTitle(title) {
         const d = parseInt(match[1]);
         const m = (match[2].length <= 2) ? parseInt(match[2]) : (monthsMap[match[2].toLowerCase().slice(0, 3)] || 1);
         const dateObj = new Date(new Date().getFullYear(), m - 1, d);
-        return `${daysArr[dateObj.getDay()]} - ${d} ${monthsArr[m - 1]}`;
+        return `${daysArr[dateObj.getDay()]} - ${d} ${monthsArr[m - 1]}`; // Возвращает "Вторник - 10 марта"
     }
     return title;
 }
 
 async function main() {
     const browser = await chromium.launch();
-    const context = await browser.newContext({ 
+    
+    // ВАЖНО: Добавлена проверка и загрузка кукисов (state.json) для обхода Госуслуг
+    const contextOptions = { 
         acceptDownloads: true,
-        deviceScaleFactor: 2, // Плотность пикселей (дает четкость)
+        deviceScaleFactor: 2, // Плотность пикселей (дает идеальную четкость текста)
         viewport: { width: 1000, height: 1200 }
-    });
+    };
+    if (fs.existsSync('state.json')) {
+        contextOptions.storageState = 'state.json';
+        console.log('✅ Куки (state.json) успешно загружены.');
+    } else {
+        console.log('⚠️ ВНИМАНИЕ: Файл state.json не найден! Возможна блокировка авторизацией.');
+    }
+
+    const context = await browser.newContext(contextOptions);
     const page = await context.newPage();
 
     try {
@@ -51,7 +61,7 @@ async function main() {
         });
         
         console.log(`Найдено ссылок: ${links.length}`);
-        let foundNews = [];
+        let foundNews =[];
         for (const url of links.slice(0, 10)) {
             const p = await context.newPage();
             try {
@@ -83,7 +93,8 @@ async function main() {
 
                 const p = await context.newPage();
                 await p.setViewportSize({ width: 1000, height: 1000 });
-                // Используем scale 2.0 для стабильности (deviceScaleFactor 2 сделает его 4.0 по факту)
+                
+                // Рендер PDF. Оптимизированный scale: 2.0, чтобы браузер не падал по Timeout!
                 await p.setContent(`
                     <html><head>
                         <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
@@ -111,36 +122,43 @@ async function main() {
                 await p.close();
 
                 const fileKey = `ch_${Date.now()}`;
+                
+                // 1. Грузим оригинальный PDF на хостинг
                 await context.request.post(`${SITE_BASE_RAW}/admin_upload_pdf.php`, {
                     data: { pass: ADMIN_PASS, data: b64Pdf, name: fileKey, ext: 'pdf' }
                 });
+                
+                // 2. Грузим скриншот (Хостинг сам переделает PNG в лёгкий JPG для Телеграма)
                 const imgRes = await context.request.post(`${SITE_BASE_RAW}/admin_upload_pdf.php`, {
                     data: { pass: ADMIN_PASS, data: screenshotBuf.toString('base64'), name: fileKey, ext: 'png' }
                 });
                 const imgUp = await imgRes.json().catch(()=>({}));
 
                 if (imgUp.ok) {
+                    // 3. Записываем в базу
                     const addRes = await context.request.post(`${SITE_BASE_RAW}/admin_change_add.php`, {
                         data: { pass: ADMIN_PASS, title: prettyTitle, url: '/api/files/' + fileKey + '.pdf', source: item.newsUrl, img_url: imgUp.url }
                     });
                     const add = await addRes.json().catch(()=>({}));
                     if (add.added) {
-                        console.log(`✅ ДОБАВЛЕНО: ${prettyTitle}`);
+                        console.log(`✅ ДОБАВЛЕНО В БАЗУ: ${prettyTitle}`);
                         lastPrettyTitle = prettyTitle;
                         lastImgUrl = imgUp.url;
                     }
                 }
-            } catch (e) { console.log(`Ошибка: ${e.message}`); }
+            } catch (e) { console.log(`Ошибка при обработке PDF: ${e.message}`); }
         }
 
+        // 4. Делаем рассылку САМОЙ СВЕЖЕЙ новости (один раз в самом конце)
         if (lastPrettyTitle && lastImgUrl) {
+            console.log(`Отправка рассылки: ${lastPrettyTitle}`);
             await context.request.post(`${SITE_BASE_RAW}/admin_broadcast.php`, {
                 data: { pass: ADMIN_PASS, text: lastPrettyTitle, img_url: lastImgUrl }
             });
         }
-    } catch (err) { console.error('Ошибка:', err.message); }
+    } catch (err) { console.error('Критическая ошибка:', err.message); }
 
-    // Очистка сайта
+    // 5. Очистка старых записей
     try {
         const listRes = await context.request.get(`${SITE_BASE_RAW}/admin_change_list.php`, { params: { pass: ADMIN_PASS } });
         const data = await listRes.json();
@@ -152,7 +170,11 @@ async function main() {
         }
     } catch (e) {}
     
+    // 6. Запуск чистильщика мертвых кнопок в Телеграме (старше 40 часов)
     await context.request.get(`${SITE_BASE_RAW}/admin_auto_cleanup.php`, { params: { pass: ADMIN_PASS } }).catch(() => {});
+    
     await browser.close();
+    console.log('--- СКРИПТ УСПЕШНО ЗАВЕРШЕН ---');
 }
+
 main();
