@@ -26,7 +26,7 @@ function formatRussianTitle(title) {
         const d = parseInt(match[1]);
         const m = (match[2].length <= 2) ? parseInt(match[2]) : (monthsMap[match[2].toLowerCase().slice(0, 3)] || 1);
         const dateObj = new Date(new Date().getFullYear(), m - 1, d);
-        return `${daysArr[dateObj.getDay()]} - ${d} ${monthsArr[m - 1]}`; // Возвращает "Вторник - 10 марта"
+        return `${daysArr[dateObj.getDay()]} - ${d} ${monthsArr[m - 1]}`;
     }
     return title;
 }
@@ -34,17 +34,16 @@ function formatRussianTitle(title) {
 async function main() {
     const browser = await chromium.launch();
     
-    // ВАЖНО: Добавлена проверка и загрузка кукисов (state.json) для обхода Госуслуг
     const contextOptions = { 
         acceptDownloads: true,
-        deviceScaleFactor: 2, // Плотность пикселей (дает идеальную четкость текста)
+        deviceScaleFactor: 2, 
         viewport: { width: 1000, height: 1200 }
     };
     if (fs.existsSync('state.json')) {
         contextOptions.storageState = 'state.json';
         console.log('✅ Куки (state.json) успешно загружены.');
     } else {
-        console.log('⚠️ ВНИМАНИЕ: Файл state.json не найден! Возможна блокировка авторизацией.');
+        console.log('⚠️ ВНИМАНИЕ: Файл state.json не найден!');
     }
 
     const context = await browser.newContext(contextOptions);
@@ -94,7 +93,6 @@ async function main() {
                 const p = await context.newPage();
                 await p.setViewportSize({ width: 1000, height: 1000 });
                 
-                // Рендер PDF. Оптимизированный scale: 2.0, чтобы браузер не падал по Timeout!
                 await p.setContent(`
                     <html><head>
                         <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
@@ -118,28 +116,47 @@ async function main() {
                 `);
 
                 await p.waitForSelector('.ready', { timeout: 60000 });
-                const screenshotBuf = await p.screenshot({ type: 'png', fullPage: true });
+                
+                // РЕШЕНИЕ ПРОБЛЕМЫ: Сразу делаем легкий JPEG качества 85%, а не тяжелый PNG!
+                const screenshotBuf = await p.screenshot({ type: 'jpeg', quality: 85, fullPage: true });
                 await p.close();
 
                 const fileKey = `ch_${Date.now()}`;
                 
-                // 1. Грузим оригинальный PDF на хостинг
-                await context.request.post(`${SITE_BASE_RAW}/admin_upload_pdf.php`, {
+                // 1. Грузим PDF
+                const pdfUpRes = await context.request.post(`${SITE_BASE_RAW}/admin_upload_pdf.php`, {
                     data: { pass: ADMIN_PASS, data: b64Pdf, name: fileKey, ext: 'pdf' }
                 });
-                
-                // 2. Грузим скриншот (Хостинг сам переделает PNG в лёгкий JPG для Телеграма)
+                if (!pdfUpRes.ok()) console.log(`⚠️ Ошибка загрузки PDF: HTTP ${pdfUpRes.status()}`);
+
+                // 2. Грузим скриншот (шлем как jpg, он легкий, лимит хостинга не порвет)
                 const imgRes = await context.request.post(`${SITE_BASE_RAW}/admin_upload_pdf.php`, {
-                    data: { pass: ADMIN_PASS, data: screenshotBuf.toString('base64'), name: fileKey, ext: 'png' }
+                    data: { pass: ADMIN_PASS, data: screenshotBuf.toString('base64'), name: fileKey, ext: 'jpg' }
                 });
-                const imgUp = await imgRes.json().catch(()=>({}));
+                
+                // Жесткий отлов ошибок: если сервер ответил не JSON, мы это увидим в логах
+                const imgText = await imgRes.text();
+                let imgUp = {};
+                try { 
+                    imgUp = JSON.parse(imgText); 
+                } catch(e) { 
+                    console.log(`❌ СЕРВЕР ВЕРНУЛ ОШИБКУ (Картинка): ${imgText.substring(0, 300)}`); 
+                }
 
                 if (imgUp.ok) {
-                    // 3. Записываем в базу
+                    // 3. Записываем в БД
                     const addRes = await context.request.post(`${SITE_BASE_RAW}/admin_change_add.php`, {
                         data: { pass: ADMIN_PASS, title: prettyTitle, url: '/api/files/' + fileKey + '.pdf', source: item.newsUrl, img_url: imgUp.url }
                     });
-                    const add = await addRes.json().catch(()=>({}));
+                    
+                    const addText = await addRes.text();
+                    let add = {};
+                    try { 
+                        add = JSON.parse(addText); 
+                    } catch(e) { 
+                        console.log(`❌ СЕРВЕР ВЕРНУЛ ОШИБКУ (БД): ${addText.substring(0, 300)}`); 
+                    }
+
                     if (add.added) {
                         console.log(`✅ ДОБАВЛЕНО В БАЗУ: ${prettyTitle}`);
                         lastPrettyTitle = prettyTitle;
@@ -149,7 +166,7 @@ async function main() {
             } catch (e) { console.log(`Ошибка при обработке PDF: ${e.message}`); }
         }
 
-        // 4. Делаем рассылку САМОЙ СВЕЖЕЙ новости (один раз в самом конце)
+        // 4. Рассылка
         if (lastPrettyTitle && lastImgUrl) {
             console.log(`Отправка рассылки: ${lastPrettyTitle}`);
             await context.request.post(`${SITE_BASE_RAW}/admin_broadcast.php`, {
@@ -170,9 +187,7 @@ async function main() {
         }
     } catch (e) {}
     
-    // 6. Запуск чистильщика мертвых кнопок в Телеграме (старше 40 часов)
     await context.request.get(`${SITE_BASE_RAW}/admin_auto_cleanup.php`, { params: { pass: ADMIN_PASS } }).catch(() => {});
-    
     await browser.close();
     console.log('--- СКРИПТ УСПЕШНО ЗАВЕРШЕН ---');
 }
