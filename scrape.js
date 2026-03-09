@@ -124,8 +124,18 @@ async function main() {
                 const fileKey = `ch_${Date.now()}`;
                 
                 // 1. Грузим PDF
-                const pdfUpRes = await context.request.post(`${SITE_BASE_RAW}/admin_upload_pdf.php`, {
+                // Добавляем пароль в URL для страховки от редиректов
+                const uploadUrl = `${SITE_BASE_RAW}/admin_upload_pdf.php?pass=${encodeURIComponent(ADMIN_PASS)}`;
+                
+                // 1. Грузим PDF
+                const pdfUpRes = await context.request.post(uploadUrl, {
                     data: { pass: ADMIN_PASS, data: b64Pdf, name: fileKey, ext: 'pdf' }
+                });
+                if (!pdfUpRes.ok()) console.log(`⚠️ Ошибка загрузки PDF: HTTP ${pdfUpRes.status()}`);
+
+                // 2. Грузим скриншот
+                const imgRes = await context.request.post(uploadUrl, {
+                    data: { pass: ADMIN_PASS, data: screenshotBuf.toString('base64'), name: fileKey, ext: 'jpg' }
                 });
                 if (!pdfUpRes.ok()) console.log(`⚠️ Ошибка загрузки PDF: HTTP ${pdfUpRes.status()}`);
 
