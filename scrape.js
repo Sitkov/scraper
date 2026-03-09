@@ -123,69 +123,48 @@ async function main() {
                 
                 const uploadUrl = `${SITE_BASE_RAW}/admin_upload_pdf.php?pass=${encodeURIComponent(ADMIN_PASS)}`;
                 
-                // 1. Грузим PDF
                 const pdfUpRes = await context.request.post(uploadUrl, {
                     data: { pass: ADMIN_PASS, data: b64Pdf, name: fileKey, ext: 'pdf' }
                 });
-                if (!pdfUpRes.ok()) console.log(`⚠️ Ошибка загрузки PDF: HTTP ${pdfUpRes.status()}`);
 
-                // 2. Грузим скриншот (jpg)
                 const imgRes = await context.request.post(uploadUrl, {
                     data: { pass: ADMIN_PASS, data: screenshotBuf.toString('base64'), name: fileKey, ext: 'jpg' }
                 });
                 
                 const imgText = await imgRes.text();
                 let imgUp = {};
-                try { 
-                    imgUp = JSON.parse(imgText); 
-                } catch(e) { 
-                    console.log(`❌ ОШИБКА ХОСТИНГА (Картинка): ${imgText.substring(0, 200)}`); 
-                }
+                try { imgUp = JSON.parse(imgText); } catch(e) {}
 
                 if (imgUp.ok) {
-                    // 3. Записываем в БД
                     const addRes = await context.request.post(`${SITE_BASE_RAW}/admin_change_add.php`, {
                         data: { pass: ADMIN_PASS, title: prettyTitle, url: '/api/files/' + fileKey + '.pdf', source: item.newsUrl, img_url: imgUp.url }
                     });
                     
                     const addText = await addRes.text();
                     let add = {};
-                    try { 
-                        add = JSON.parse(addText); 
-                    } catch(e) { 
-                        console.log(`❌ ОШИБКА ХОСТИНГА (БД): ${addText.substring(0, 200)}`); 
-                    }
+                    try { add = JSON.parse(addText); } catch(e) {}
 
-                    if (add.added) {
-                        console.log(`✅ ДОБАВЛЕНО В БАЗУ: ${prettyTitle}`);
+                    // ВОТ ЗДЕСЬ ИСПРАВЛЕНИЕ: Ждем только реально НОВОЕ расписание
+                    if (add.added && add.is_new) {
+                        console.log(`✅ ДОБАВЛЕНО НОВОЕ РАСПИСАНИЕ: ${prettyTitle}`);
                         lastPrettyTitle = prettyTitle;
                         lastImgUrl = imgUp.url;
+                    } else if (add.added && !add.is_new) {
+                        console.log(`🔄 Уже есть в базе: ${prettyTitle}`);
                     }
                 }
             } catch (e) { console.log(`Ошибка при обработке PDF: ${e.message}`); }
         }
 
-        // 4. Рассылка
+        // 4. Рассылка будет только если lastPrettyTitle заполнился (то есть новость реально новая)
         if (lastPrettyTitle && lastImgUrl) {
-            console.log(`Отправка рассылки: ${lastPrettyTitle}`);
+            console.log(`📨 Отправка рассылки: ${lastPrettyTitle}`);
             await context.request.post(`${SITE_BASE_RAW}/admin_broadcast.php`, {
                 data: { pass: ADMIN_PASS, text: lastPrettyTitle, img_url: lastImgUrl }
             });
         }
     } catch (err) { console.error('Критическая ошибка:', err.message); }
 
-    // 5. Очистка старых записей
-    try {
-        const listRes = await context.request.get(`${SITE_BASE_RAW}/admin_change_list.php`, { params: { pass: ADMIN_PASS } });
-        const data = await listRes.json();
-        if (data.items && data.items.length > MAX_KEEP) {
-            const sorted = data.items.map(it => ({ ...it, w: parseNewsDate(it.title) })).sort((a,b) => b.w - a.w);
-            for (const it of sorted.slice(MAX_KEEP)) {
-                await context.request.post(`${SITE_BASE_RAW}/admin_change_delete.php`, { data: { pass: ADMIN_PASS, id: it.id } });
-            }
-        }
-    } catch (e) {}
-    
     await context.request.get(`${SITE_BASE_RAW}/admin_auto_cleanup.php`, { params: { pass: ADMIN_PASS } }).catch(() => {});
     await browser.close();
     console.log('--- СКРИПТ УСПЕШНО ЗАВЕРШЕН ---');
