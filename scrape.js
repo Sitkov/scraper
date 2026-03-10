@@ -144,7 +144,6 @@ async function main() {
                     let add = {};
                     try { add = JSON.parse(addText); } catch(e) {}
 
-                    // ВОТ ЗДЕСЬ ИСПРАВЛЕНИЕ: Ждем только реально НОВОЕ расписание
                     if (add.added && add.is_new) {
                         console.log(`✅ ДОБАВЛЕНО НОВОЕ РАСПИСАНИЕ: ${prettyTitle}`);
                         lastPrettyTitle = prettyTitle;
@@ -156,22 +155,21 @@ async function main() {
             } catch (e) { console.log(`Ошибка при обработке PDF: ${e.message}`); }
         }
 
-        // 4. Рассылка будет только если lastPrettyTitle заполнился (то есть новость реально новая)
-       // 4. Рассылка будет только если lastPrettyTitle заполнился
+        // 4. РАССЫЛКА
         if (lastPrettyTitle && lastImgUrl) {
             console.log(`📨 Отправка рассылки: ${lastPrettyTitle}`);
             
-            // ВАЖНО: Добавили пароль прямо в URL, чтобы он не терялся
             const bUrl = `${SITE_BASE_RAW}/admin_broadcast.php?pass=${encodeURIComponent(ADMIN_PASS)}`;
-            
             const bRes = await context.request.post(bUrl, {
                 data: { pass: ADMIN_PASS, text: lastPrettyTitle, img_url: lastImgUrl }
             });
             
-            // Заставим скрапер показать нам, что ответил хостинг!
+            // Логируем точный ответ от хостинга (почему не доходит рассылка)
             const bText = await bRes.text();
             console.log(`ОТВЕТ СЕРВЕРА РАССЫЛКИ:`, bText);
         }
+
+    } catch (err) { console.error('Критическая ошибка:', err.message); }
 
     await context.request.get(`${SITE_BASE_RAW}/admin_auto_cleanup.php`, { params: { pass: ADMIN_PASS } }).catch(() => {});
     await browser.close();
