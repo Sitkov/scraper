@@ -157,13 +157,21 @@ async function main() {
         }
 
         // 4. Рассылка будет только если lastPrettyTitle заполнился (то есть новость реально новая)
+       // 4. Рассылка будет только если lastPrettyTitle заполнился
         if (lastPrettyTitle && lastImgUrl) {
             console.log(`📨 Отправка рассылки: ${lastPrettyTitle}`);
-            await context.request.post(`${SITE_BASE_RAW}/admin_broadcast.php`, {
+            
+            // ВАЖНО: Добавили пароль прямо в URL, чтобы он не терялся
+            const bUrl = `${SITE_BASE_RAW}/admin_broadcast.php?pass=${encodeURIComponent(ADMIN_PASS)}`;
+            
+            const bRes = await context.request.post(bUrl, {
                 data: { pass: ADMIN_PASS, text: lastPrettyTitle, img_url: lastImgUrl }
             });
+            
+            // Заставим скрапер показать нам, что ответил хостинг!
+            const bText = await bRes.text();
+            console.log(`ОТВЕТ СЕРВЕРА РАССЫЛКИ:`, bText);
         }
-    } catch (err) { console.error('Критическая ошибка:', err.message); }
 
     await context.request.get(`${SITE_BASE_RAW}/admin_auto_cleanup.php`, { params: { pass: ADMIN_PASS } }).catch(() => {});
     await browser.close();
